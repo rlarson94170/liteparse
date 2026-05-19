@@ -13,13 +13,6 @@ Install LiteParse globally via npm to use the `lit` command anywhere:
 npm i -g @llamaindex/liteparse
 ```
 
-For macOS and Linux users, LiteParse can be also installed via `brew`:
-
-```bash
-brew tap run-llama/liteparse
-brew install llamaindex-liteparse
-```
-
 ## Quick start
 
 Once installed, you can start parsing from the command line:

@@ -52,13 +52,6 @@ lit parse document.pdf
 lit screenshot document.pdf
 ```
 
-For macOS and Linux users, `liteparse` can be also installed via `brew`:
-
-```bash
-brew tap run-llama/liteparse
-brew install llamaindex-liteparse
-```
-
 #### Option 2: Install from Source
 
 You can clone the repo and install the CLI globally from source:
