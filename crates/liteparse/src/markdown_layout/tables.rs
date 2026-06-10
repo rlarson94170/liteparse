@@ -54,6 +54,10 @@ pub(super) struct TableCell {
 pub(super) struct TableRun {
     pub(super) start: usize,
     pub(super) end: usize,
+    /// First line index of the table's *body* rows. Differs from `start` when
+    /// header lines above the body were absorbed into the run; the cluster
+    /// re-extraction pass must not re-bin those header lines as body rows.
+    pub(super) body_start: usize,
     pub(super) block: Block,
 }
 
@@ -525,6 +529,35 @@ fn cells_from_raw_items_with_tracks(
     Some(cells)
 }
 
+/// Letters strictly outnumber digits — discriminates word-like labels
+/// (group headers) from merged numeric runs ("$448 $427 7%").
+fn is_alpha_dominant(text: &str) -> bool {
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    let digits = text.chars().filter(|c| c.is_ascii_digit()).count();
+    letters > digits
+}
+
+/// Measurement-value shape: a decimal number ("2.28"), currency/percent,
+/// comma-grouped number ("1,240"), or a dash placeholder ("--" / "—").
+/// Bare integers (years, codes) deliberately do NOT match — they appear in
+/// legitimate header layers.
+fn is_value_like(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().all(|c| matches!(c, '-' | '—' | '–')) {
+        return true;
+    }
+    if t.contains('$') || t.contains('%') || t.contains('±') {
+        return true;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    chars
+        .windows(3)
+        .any(|w| w[0].is_ascii_digit() && (w[1] == '.' || w[1] == ',') && w[2].is_ascii_digit())
+}
+
 /// Split a multi-track-spanning span's text into one piece per covered track
 /// by picking whitespace positions whose linearly-interpolated x is closest
 /// to each subsequent anchor. Returns `Some(pieces)` of length
@@ -762,6 +795,7 @@ fn try_detect_table_inferred(
     Some(TableRun {
         start: run_start,
         end,
+        body_start: start_idx,
         block: Block::Table {
             header,
             rows: body_rows,
@@ -942,6 +976,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         return Some(TableRun {
             start: start_idx,
             end,
+            body_start: start_idx,
             block: Block::GridFallback { lines: raw },
         });
     }
@@ -978,9 +1013,16 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         return None;
     }
 
+    if std::env::var("LITEPARSE_DEBUG_TABLE").is_ok() {
+        eprintln!(
+            "[tbl-detect @{start_idx}..{end}] cols={column_count} header={header:?} rows={}",
+            body_rows.len()
+        );
+    }
     Some(TableRun {
         start: run_start,
         end,
+        body_start: start_idx,
         block: Block::Table {
             header,
             rows: body_rows,
@@ -999,11 +1041,23 @@ fn absorb_header_lines(
     column_count: usize,
     floor: usize,
 ) -> Option<(usize, Vec<String>)> {
+    let dbgt = std::env::var("LITEPARSE_DEBUG_TABLE").is_ok();
     let mut absorbed: Vec<Vec<TableCell>> = Vec::new();
     let mut j = start_idx;
     while j > floor {
         let cand = j - 1;
         let cells = split_cells(&lines[cand]);
+        if dbgt {
+            let texts: Vec<&str> = cells.iter().map(|c| c.text.as_str()).collect();
+            eprintln!(
+                "[tbl-absorb cand @{cand} {:?}] cells={texts:?} extents={:?}",
+                lines[cand].text.chars().take(40).collect::<String>(),
+                cells
+                    .iter()
+                    .map(|c| (c.start_x as i32, c.end_x as i32))
+                    .collect::<Vec<_>>()
+            );
+        }
         // A header line must carry at least two cells (a single cell is a
         // title/caption, not a header) and sit tight above the row below it.
         if cells.len() < 2 {
@@ -1068,7 +1122,17 @@ pub(super) fn detect_tables(lines: &[ProjectedLine]) -> Vec<TableRun> {
             i += 1;
         }
     }
-    merge_consecutive_table_runs(out, lines)
+    let mut merged = merge_consecutive_table_runs(out, lines);
+    // Iterate to fixpoint (bounded): a merged cluster is itself a table run
+    // that may now sit adjacent to the next fragment cluster.
+    for _ in 0..4 {
+        let before = merged.len();
+        merged = merge_fragmented_table_clusters(merged, lines);
+        if merged.len() == before {
+            break;
+        }
+    }
+    merged
 }
 
 // ── Description-list 2-column table detector ──────────────────────────────
@@ -1377,6 +1441,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
     Some(TableRun {
         start: start_idx,
         end: j,
+        body_start: start_idx,
         block: Block::Table {
             header: None,
             rows: body,
@@ -1475,6 +1540,460 @@ fn merge_consecutive_table_runs(runs: Vec<TableRun>, lines: &[ProjectedLine]) ->
         out.push(run);
     }
     out
+}
+
+// ── Fragmented-cluster re-extraction ───────────────────────────────────────
+//
+// `try_detect_table` closes a run whenever the per-row cell count changes, so
+// one real table with sparse rows (row-label column present on some rows
+// only, empty value columns on others) fragments into several runs at
+// different column counts, with stranded single rows between them. The pairs
+// of fragments rarely satisfy `try_merge_pair`'s same-cols / |A|+1==|B|
+// cases. This pass takes the opposite approach: instead of mapping fragment
+// columns onto each other, it re-derives the *union* column track set from
+// the raw PDFium span positions across the whole cluster and re-extracts
+// every line against those tracks. Sparse rows get empty cells, merged spans
+// split at track anchors, and the cluster emits as one table.
+//
+// Only fires when ≥2 table runs are already y-adjacent — prose never enters
+// this path, so the false-positive surface is limited to "two genuinely
+// separate stacked tables", which the both-complete guard rejects.
+
+/// Max non-table lines between two runs for them to join one cluster.
+const TABLE_CLUSTER_MAX_INTERSTITIAL_LINES: usize = 2;
+
+/// Abort the cluster merge when more than this fraction of the window's
+/// lines can't be binned into the union tracks.
+const TABLE_CLUSTER_MAX_FAILED_ROW_FRAC: f32 = 0.3;
+
+/// Max header lines walked above the cluster body by the union header pass.
+const TABLE_CLUSTER_MAX_HEADER_LINES: usize = 4;
+
+fn merge_fragmented_table_clusters(runs: Vec<TableRun>, lines: &[ProjectedLine]) -> Vec<TableRun> {
+    if runs.len() < 2 || std::env::var("LITEPARSE_DISABLE_CLUSTER_MERGE").is_ok() {
+        return runs;
+    }
+    let dbgt = std::env::var("LITEPARSE_DEBUG_TABLE").is_ok();
+    let mut out: Vec<TableRun> = Vec::with_capacity(runs.len());
+    let mut i = 0;
+    while i < runs.len() {
+        let mut j = i + 1;
+        while j < runs.len() && cluster_adjacent(&runs[j - 1], &runs[j], lines) {
+            j += 1;
+        }
+        if j - i >= 2 {
+            let floor = out.last().map(|r| r.end).unwrap_or(0);
+            if let Some(merged) = build_union_table(&runs[i..j], lines, floor) {
+                if dbgt {
+                    eprintln!(
+                        "[tbl-cluster] merged {} runs (lines {}..{}) into one table",
+                        j - i,
+                        merged.start,
+                        merged.end
+                    );
+                }
+                out.push(merged);
+                i = j;
+                continue;
+            } else if dbgt {
+                eprintln!(
+                    "[tbl-cluster] union build failed for {} runs @{}..{}",
+                    j - i,
+                    runs[i].start,
+                    runs[j - 1].end
+                );
+            }
+        }
+        out.push(runs[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn cluster_adjacent(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> bool {
+    let (a_header, a_rows_len) = match &a.block {
+        Block::Table { header, rows } => (header.is_some(), rows.len()),
+        _ => return false,
+    };
+    let (b_header, b_rows_len) = match &b.block {
+        Block::Table { header, rows } => (header.is_some(), rows.len()),
+        _ => return false,
+    };
+    if b.start.saturating_sub(a.end) > TABLE_CLUSTER_MAX_INTERSTITIAL_LINES {
+        return false;
+    }
+    if a.end == 0 || a.end > lines.len() || b.start >= lines.len() {
+        return false;
+    }
+    let a_last = &lines[a.end - 1];
+    let b_first = &lines[b.start];
+    let line_height = a_last.bbox.height.max(b_first.bbox.height).max(1.0);
+    let gap = b_first.bbox.y - (a_last.bbox.y + a_last.bbox.height);
+    if gap > line_height * TABLE_MERGE_MAX_Y_GAP_LINES || gap < -line_height {
+        return false;
+    }
+    // Two complete-looking tables (both with explicit headers and real bodies)
+    // separated by a visible gap are most likely genuinely separate tables.
+    let both_complete = a_header && b_header && a_rows_len >= 3 && b_rows_len >= 3;
+    if both_complete && gap > line_height {
+        return false;
+    }
+    // Track compatibility: fragments of one table share column geometry (the
+    // narrower fragment's tracks are a subset of the wider one's), while two
+    // genuinely different stacked tables (e.g. a 2-col label/value list above
+    // a 4-col transaction table) do not. Without this gate the union merge
+    // fuses them and shreds both. Require ≥75% of the narrower run's tracks
+    // to align to the wider run's tracks.
+    let dbgt = std::env::var("LITEPARSE_DEBUG_TABLE").is_ok();
+    let (Some(a_tracks), Some(b_tracks)) = (run_body_tracks(a, lines), run_body_tracks(b, lines))
+    else {
+        // Inferred-path runs often have no line whose split_cells count
+        // matches the declared column count, so tracks can't be re-derived.
+        // Stay permissive — build_union_table's own soundness guards (width
+        // check, failed-row fraction) still gate the actual merge.
+        return true;
+    };
+    let (narrow, wide) = if a_tracks.len() <= b_tracks.len() {
+        (&a_tracks, &b_tracks)
+    } else {
+        (&b_tracks, &a_tracks)
+    };
+    let matched = narrow
+        .iter()
+        .filter(|&&t| {
+            wide.iter()
+                .any(|&w| subset_match_score(t, w, TABLE_SUBSET_TRACK_TOLERANCE_PT).is_some())
+        })
+        .count();
+    let ok = (matched as f32) >= (narrow.len() as f32) * 0.75;
+    if !ok && dbgt {
+        eprintln!(
+            "[tbl-cluster] adjacency reject @{}..{}: tracks {}/{} matched (narrow=[{}] wide=[{}])",
+            a.start,
+            b.end,
+            matched,
+            narrow.len(),
+            narrow
+                .iter()
+                .map(|t| format!("{:.0}-{:.0}", t.0, t.1))
+                .collect::<Vec<_>>()
+                .join(","),
+            wide.iter()
+                .map(|t| format!("{:.0}-{:.0}", t.0, t.1))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    ok
+}
+
+/// Union column tracks across a window: every row with ≥2 gap-split cells
+/// contributes its cell start-x positions; positions cluster at
+/// `TABLE_TRACK_TOLERANCE_PT`. Cells (not raw spans) are the unit here —
+/// multi-word cell content emits several PDFium spans whose x positions are
+/// word starts, not column starts, and would shred the track set.
+fn union_tracks_in_window(lines: &[ProjectedLine], start: usize, end: usize) -> Vec<(f32, usize)> {
+    let mut xs: Vec<f32> = Vec::new();
+    for line in &lines[start..end.min(lines.len())] {
+        let cells = split_cells(line);
+        if cells.len() >= 2 {
+            xs.extend(cells.iter().map(|c| c.start_x));
+        }
+    }
+    xs.sort_by(f32::total_cmp);
+    let mut clusters: Vec<(f32, usize)> = Vec::new();
+    let mut current_sum = 0.0f32;
+    let mut current_count = 0usize;
+    let mut current_anchor = f32::NEG_INFINITY;
+    for &x in &xs {
+        // Looser tolerance than the per-run paths: center-aligned columns
+        // jitter their cell start-x by the half-width difference of their
+        // content (±10pt is routine); near-duplicate tracks get coalesced
+        // by the caller.
+        if current_count == 0 || (x - current_anchor).abs() <= TABLE_SUBSET_TRACK_TOLERANCE_PT {
+            current_sum += x;
+            current_count += 1;
+            current_anchor = current_sum / current_count as f32;
+        } else {
+            clusters.push((current_sum / current_count as f32, current_count));
+            current_sum = x;
+            current_count = 1;
+            current_anchor = x;
+        }
+    }
+    if current_count > 0 {
+        clusters.push((current_sum / current_count as f32, current_count));
+    }
+    clusters
+}
+
+/// Bin a line into the union tracks via its gap-split cells when the raw-span
+/// path fails: each cell maps to the nearest track (by start-x, within the
+/// loose subset tolerance) and all cells must map to distinct tracks. Unlike
+/// the body-detection paths this accepts 1-cell rows — inside a confirmed
+/// table cluster a lone label at a track is a sparse row (e.g. a row-label
+/// city with every value column empty), not prose.
+fn sparse_row_via_cells(line: &ProjectedLine, tracks: &[f32]) -> Option<Vec<String>> {
+    let cells = split_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    let tol = TABLE_SUBSET_TRACK_TOLERANCE_PT;
+    let mut mapping: Vec<usize> = Vec::with_capacity(cells.len());
+    for c in &cells {
+        let (idx, d) = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (i, (c.start_x - t).abs()))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        if d > tol {
+            return None;
+        }
+        mapping.push(idx);
+    }
+    let mut distinct = mapping.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != mapping.len() {
+        return None;
+    }
+    let mut row = vec![String::new(); tracks.len()];
+    for (c, &idx) in cells.iter().zip(&mapping) {
+        row[idx] = c.text.clone();
+    }
+    Some(row)
+}
+
+/// Walk upward from the cluster's body start, binning each candidate header
+/// line's raw spans into the union tracks. A span covering multiple tracks
+/// (a group header like `EFETIVO` spanning its `ENFERMARIA`/`QUARTO`
+/// sub-columns) replicates its text across every covered track — the pipe
+/// table flattening of a colspan'd grid header. Layers stack top-to-bottom
+/// per column. Returns `(new_start, header)`.
+fn union_header_from_above(
+    lines: &[ProjectedLine],
+    body_start: usize,
+    floor: usize,
+    tracks: &[f32],
+) -> Option<(usize, Vec<String>)> {
+    let tol = TABLE_TRACK_TOLERANCE_PT;
+    // Fallback assignment for centered header cells whose extent doesn't
+    // reach the track anchor: nearest track within half the local gap.
+    let assign_nearest = |x_center: f32| -> Option<usize> {
+        let (idx, d) = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (i, (x_center - t).abs()))
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        let local_gap = if idx + 1 < tracks.len() {
+            tracks[idx + 1] - tracks[idx]
+        } else if idx > 0 {
+            tracks[idx] - tracks[idx - 1]
+        } else {
+            f32::INFINITY
+        };
+        if d <= (local_gap * 0.5).max(TABLE_SUBSET_TRACK_TOLERANCE_PT) {
+            Some(idx)
+        } else {
+            None
+        }
+    };
+    let mut layers: Vec<Vec<String>> = Vec::new();
+    let mut j = body_start;
+    while j > floor && layers.len() < TABLE_CLUSTER_MAX_HEADER_LINES {
+        let cand = j - 1;
+        if !table_rows_adjacent(&lines[cand], &lines[j]) {
+            break;
+        }
+        let spans: Vec<&TextItem> = lines[cand]
+            .spans
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .collect();
+        if spans.len() < 2 {
+            break;
+        }
+        let mut layer = vec![String::new(); tracks.len()];
+        let mut ok = true;
+        for s in &spans {
+            let x0 = s.x;
+            let x1 = s.x + s.width.max(0.0);
+            let covered: Vec<usize> = tracks
+                .iter()
+                .enumerate()
+                .filter(|&(_, &t)| t >= x0 - tol && t <= x1 + tol)
+                .map(|(i, _)| i)
+                .collect();
+            let targets: Vec<usize> = if !covered.is_empty() {
+                covered
+            } else if let Some(idx) = assign_nearest((x0 + x1) * 0.5) {
+                vec![idx]
+            } else {
+                ok = false;
+                break;
+            };
+            for idx in targets {
+                let dst = &mut layer[idx];
+                if !dst.is_empty() {
+                    dst.push(' ');
+                }
+                dst.push_str(s.text.trim());
+            }
+        }
+        if !ok || layer.iter().filter(|t| !t.is_empty()).count() < 2 {
+            break;
+        }
+        layers.push(layer);
+        j = cand;
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    layers.reverse();
+    let header: Vec<String> = (0..tracks.len())
+        .map(|col| {
+            let mut parts: Vec<&str> = Vec::new();
+            for layer in &layers {
+                let s = layer[col].as_str();
+                if s.is_empty() || parts.last() == Some(&s) {
+                    continue;
+                }
+                parts.push(s);
+            }
+            parts.join(" ")
+        })
+        .collect();
+    if header.iter().all(|h| h.is_empty()) {
+        return None;
+    }
+    Some((j, header))
+}
+
+/// Re-extract a cluster of adjacent table runs as one table against the
+/// union track set. Returns `None` (leaving the original runs untouched)
+/// when the union tracks are unsound or too many lines fail to bin.
+fn build_union_table(
+    cluster: &[TableRun],
+    lines: &[ProjectedLine],
+    floor: usize,
+) -> Option<TableRun> {
+    let dbgt = std::env::var("LITEPARSE_DEBUG_TABLE").is_ok();
+    let window_start = cluster.first()?.body_start;
+    let window_end = cluster.last()?.end.min(lines.len());
+    if window_start >= window_end {
+        return None;
+    }
+    let mut supported = union_tracks_in_window(lines, window_start, window_end);
+    // Drop low-support tracks: a column that only 1-2 cells across the whole
+    // cluster ever start at is noise (wrapped-cell continuation indents,
+    // intra-cell splits on widely-tracked text), not a real column.
+    let window_len = window_end - window_start;
+    let min_support = 2.max(window_len / 10);
+    supported.retain(|&(_, n)| n >= min_support);
+    // Coalesce adjacent tracks closer than a real column gutter — these are
+    // start-x jitter of one center-aligned column (content of different
+    // widths), not two columns. Real word-gap prose would coalesce down to a
+    // handful of wide tracks and then fail the width check below.
+    let mut font_sizes: Vec<f32> = lines[window_start..window_end]
+        .iter()
+        .map(|l| {
+            if l.dominant_font_size > 0.0 {
+                l.dominant_font_size
+            } else {
+                l.bbox.height.max(1.0)
+            }
+        })
+        .collect();
+    font_sizes.sort_by(f32::total_cmp);
+    let median_font = font_sizes[font_sizes.len() / 2];
+    let min_track_gap = (median_font * 1.5).max(12.0);
+    let mut coalesced: Vec<(f32, usize)> = Vec::with_capacity(supported.len());
+    for (t, n) in supported {
+        match coalesced.last_mut() {
+            Some((last, last_n)) if t - *last < min_track_gap => {
+                // Support-weighted midpoint keeps the anchor near the
+                // dominant alignment.
+                *last = (*last * *last_n as f32 + t * n as f32) / (*last_n + n) as f32;
+                *last_n += n;
+            }
+            _ => coalesced.push((t, n)),
+        }
+    }
+    let tracks: Vec<f32> = coalesced.into_iter().map(|(t, _)| t).collect();
+    if tracks.len() < TABLE_MIN_COLUMNS {
+        return None;
+    }
+    // The union must be at least as wide as the widest fragment — otherwise
+    // re-extraction would lose columns the per-run detection already found
+    // (and a word-gap prose union that coalesced to nothing lands here too).
+    let max_run_cols = cluster.iter().filter_map(run_column_count).max()?;
+    if tracks.len() < max_run_cols {
+        if dbgt {
+            eprintln!(
+                "[tbl-cluster] reject: {} tracks < widest fragment {max_run_cols} ([{}])",
+                tracks.len(),
+                tracks
+                    .iter()
+                    .map(|t| format!("{t:.0}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        return None;
+    }
+
+    // NOTE: no vertical wrap-merge here. Gap-based merging of multi-line
+    // cells was tried and reverted — inside uniformly-leaded tables the gap
+    // between a wrapped cell line and a genuine next row is identical, so
+    // any threshold either shreds multi-line cells (no merge) or fuses
+    // adjacent logical rows (merge). Re-extracted clusters keep one row per
+    // line; multi-line-cell recovery needs a stronger signal (ruled-grid row
+    // boundaries, or label-column row anchoring).
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut failed_count = 0usize;
+    for idx in window_start..window_end {
+        let line = &lines[idx];
+        if let Some(cells) = cells_from_raw_items_with_tracks(line, &tracks) {
+            if cells.iter().any(|c| !c.text.is_empty()) {
+                rows.push(cells.into_iter().map(|c| c.text).collect());
+            }
+        } else if let Some(row) = sparse_row_via_cells(line, &tracks) {
+            rows.push(row);
+        } else {
+            // The line couldn't bin but still carries content — keep its
+            // full text as a column-0 row rather than dropping it. Counted
+            // toward the abort threshold below.
+            failed_count += 1;
+            let text = line.text.trim();
+            if !text.is_empty() {
+                let mut row = vec![String::new(); tracks.len()];
+                row[0] = collapse_whitespace(text);
+                rows.push(row);
+            }
+        }
+    }
+    let window_len = window_end - window_start;
+    if (failed_count as f32) > (window_len as f32) * TABLE_CLUSTER_MAX_FAILED_ROW_FRAC {
+        if dbgt {
+            eprintln!("[tbl-cluster] reject: {failed_count}/{window_len} lines unbinnable");
+        }
+        return None;
+    }
+    if rows.len() < TABLE_MIN_ROWS {
+        return None;
+    }
+
+    let absorbed = union_header_from_above(lines, window_start, floor, &tracks);
+    let (start, header) = match absorbed {
+        Some((hstart, header)) => (hstart, Some(header)),
+        None => (window_start, None),
+    };
+    Some(TableRun {
+        start,
+        end: window_end,
+        body_start: window_start,
+        block: Block::Table { header, rows },
+    })
 }
 
 fn run_column_count(run: &TableRun) -> Option<usize> {
@@ -1698,6 +2217,7 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         return Some(TableRun {
             start: a.start,
             end: b.end,
+            body_start: a.body_start,
             block: Block::Table { header, rows },
         });
     }
@@ -1747,6 +2267,9 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
         return Some(TableRun {
             start: a.start,
             end: b.end,
+            // A was folded into B's header, so the merged table's body
+            // begins where B's body did.
+            body_start: b.body_start,
             block: Block::Table {
                 header: Some(merged_header),
                 rows: merged_rows,
@@ -1801,6 +2324,12 @@ const TABLE_GRID_CLUSTER_PT: f32 = 2.0;
 /// when rules don't quite reach the corner because the PDF drew them as
 /// individual segments with small gaps.
 const TABLE_CROSS_TOLERANCE_PT: f32 = 3.0;
+
+/// Cluster tolerance for ruled column boundaries. Wider than
+/// `TABLE_GRID_CLUSTER_PT` because adjacent cell-border rects draw paired
+/// edges 4-6pt apart; real columns are ≥ ~10pt wide so the mean-centered
+/// merge cannot eat a genuine narrow column.
+const TABLE_COL_BOUNDARY_CLUSTER_PT: f32 = 6.0;
 
 /// Reject ruled-table candidates whose empty-cell fraction exceeds this.
 /// NOTE: this can't be loosened to recover blank worksheets/forms — a real
@@ -2021,6 +2550,7 @@ fn build_ruled_table(
     page_width: f32,
     page_height: f32,
 ) -> Option<TableRun> {
+    let dbg = std::env::var("LITEPARSE_DEBUG_RULED").is_ok();
     // Distinct row y-coords (cluster again — multiple H lines may share a y).
     let mut ys: Vec<f32> = h_indices.iter().map(|&i| hs[i].y).collect();
     ys.sort_by(|a, b| a.total_cmp(b));
@@ -2028,7 +2558,18 @@ fn build_ruled_table(
 
     let mut xs: Vec<f32> = v_indices.iter().map(|&i| vs[i].x).collect();
     xs.sort_by(|a, b| a.total_cmp(b));
-    dedup_close(&mut xs, TABLE_GRID_CLUSTER_PT);
+    // Coarser, mean-centered clustering for column boundaries: cell-border
+    // rects contribute paired edges 4-6pt apart that would otherwise become
+    // phantom 5pt "columns" the span splitter then shreds text into.
+    cluster_boundaries(&mut xs, TABLE_COL_BOUNDARY_CLUSTER_PT);
+    if dbg {
+        eprintln!(
+            "[ruled] component: ys={:?} xs={:?} ({} lines in scope)",
+            ys,
+            xs,
+            lines.len()
+        );
+    }
 
     // Need ≥2 row boundaries (1 row) and ≥2 column boundaries (1 col); but
     // a 1×1 grid is just a callout box, so also require ≥1 inner divider
@@ -2036,6 +2577,13 @@ fn build_ruled_table(
     // are accepted when row evidence is strong enough — extra guards apply
     // below after the empty-row collapse.
     if ys.len() < 3 || xs.len() < 2 {
+        if dbg {
+            eprintln!(
+                "[ruled]   REJECT grid-too-small ys={} xs={}",
+                ys.len(),
+                xs.len()
+            );
+        }
         return None;
     }
 
@@ -2052,46 +2600,171 @@ fn build_ruled_table(
     if page_width > 0.0 && page_height > 0.0 {
         let coverage = (bbox.width / page_width) * (bbox.height / page_height);
         if coverage > TABLE_MAX_PAGE_COVERAGE {
+            if dbg {
+                eprintln!("[ruled]   REJECT page-coverage {coverage:.2}");
+            }
             return None;
         }
     }
 
-    // Assign each text line to its cell by centroid.
+    // Assign text to cells. A projected line frequently spans several ruled
+    // columns (one baseline = one line), so binning whole lines by centroid
+    // lumps an entire row into one cell and leaves the rest empty — the
+    // empty-cell filter then rejects the real table. Instead bin each line's
+    // raw spans by span center; spans whose x-extent crosses one or more
+    // interior column boundaries are split at the whitespace nearest each
+    // crossed boundary (same interpolation as the inferred-track path).
     let mut cells: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
     let mut cell_is_bold: Vec<Vec<bool>> = vec![vec![true; n_cols]; n_rows];
     let mut cell_has_text: Vec<Vec<bool>> = vec![vec![false; n_cols]; n_rows];
+    // Parallel grid where a span crossing ≥2 column boundaries contributes
+    // its FULL text to every covered cell (colspan semantics) instead of the
+    // whitespace split. Only consulted for header-band flattening — a group
+    // header like "North America" centered over its Revenue/Units sub-columns
+    // must replicate, while the same geometry in a data row is a merged run
+    // that should split.
+    let mut cells_repl: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
+    let mut row_alpha_spanner: Vec<bool> = vec![false; n_rows];
     let mut consumed_indices: Vec<usize> = Vec::new();
+    const GRID_X_SLACK_PT: f32 = 6.0;
 
-    for (idx, line) in lines.iter().enumerate() {
-        let cx = line.bbox.x + line.bbox.width * 0.5;
-        let cy = line.bbox.y + line.bbox.height * 0.5;
-        if cy < ys[0] || cy > ys[n_rows] || cx < xs[0] || cx > xs[n_cols] {
-            continue;
-        }
-        let row = match find_bucket(&ys, cy) {
-            Some(r) => r,
-            None => continue,
-        };
-        let col = match find_bucket(&xs, cx) {
-            Some(c) => c,
-            None => continue,
-        };
-        let txt = line.text.trim();
+    let mut push_cell = |cells: &mut Vec<Vec<String>>,
+                         cell_has_text: &mut Vec<Vec<bool>>,
+                         row: usize,
+                         col: usize,
+                         txt: &str| {
+        let txt = txt.trim();
         if txt.is_empty() {
-            continue;
+            return;
         }
         if !cells[row][col].is_empty() {
             cells[row][col].push(' ');
         }
         cells[row][col].push_str(txt);
         cell_has_text[row][col] = true;
-        if !line.all_bold {
-            cell_is_bold[row][col] = false;
+    };
+
+    for (idx, line) in lines.iter().enumerate() {
+        let cy = line.bbox.y + line.bbox.height * 0.5;
+        if cy < ys[0] || cy > ys[n_rows] {
+            continue;
+        }
+        // Line-level row bucket. Used by the no-spans fallback and as the
+        // default when a span's own y doesn't resolve. Spans bin by their own
+        // baseline below — a projected line can merge text from several ruled
+        // rows (e.g. a multi-baseline wrapped header emitted as one line).
+        let row = match find_bucket(&ys, cy) {
+            Some(r) => r,
+            None => continue,
+        };
+        if line.text.trim().is_empty() {
+            continue;
+        }
+
+        // Only consume the line when its text sits inside the grid
+        // horizontally — a line poking past the grid edge belongs (at least
+        // partly) to surrounding prose, and consuming it would lose text.
+        let line_x0 = line.bbox.x;
+        let line_x1 = line.bbox.x + line.bbox.width;
+        if line_x0 < xs[0] - GRID_X_SLACK_PT || line_x1 > xs[n_cols] + GRID_X_SLACK_PT {
+            if dbg {
+                eprintln!(
+                    "[ruled]   skip-overhang row={row} x={line_x0:.0}..{line_x1:.0} grid={:.0}..{:.0} text={:?}",
+                    xs[0],
+                    xs[n_cols],
+                    &line.text.chars().take(60).collect::<String>()
+                );
+            }
+            continue;
+        }
+
+        let text_spans: Vec<&TextItem> = line
+            .spans
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .collect();
+        let push_repl = |cells_repl: &mut Vec<Vec<String>>, row: usize, col: usize, txt: &str| {
+            let txt = txt.trim();
+            if txt.is_empty() {
+                return;
+            }
+            let dst = &mut cells_repl[row][col];
+            if !dst.is_empty() {
+                dst.push(' ');
+            }
+            dst.push_str(txt);
+        };
+
+        if text_spans.is_empty() {
+            // No raw text spans (synthetic/OCR lines): old whole-line centroid path.
+            let cx = line.bbox.x + line.bbox.width * 0.5;
+            if let Some(col) = find_bucket(&xs, cx.clamp(xs[0], xs[n_cols])) {
+                push_cell(&mut cells, &mut cell_has_text, row, col, &line.text);
+                push_repl(&mut cells_repl, row, col, &line.text);
+                if !line.all_bold {
+                    cell_is_bold[row][col] = false;
+                }
+                consumed_indices.push(idx);
+            }
+            continue;
+        }
+
+        for span in text_spans {
+            // Per-span row: a span carries its own baseline y, which may sit
+            // in a different ruled row than the line centroid.
+            let span_cy = span.y + span.height * 0.5;
+            let row = find_bucket(&ys, span_cy.clamp(ys[0], ys[n_rows])).unwrap_or(row);
+            let sx0 = (span.x).clamp(xs[0], xs[n_cols]);
+            let sx1 = (span.x + span.width).clamp(xs[0], xs[n_cols]);
+            let c_lo = find_bucket(&xs, sx0).unwrap_or(0);
+            let c_hi = find_bucket(&xs, sx1).unwrap_or(n_cols - 1);
+            if c_lo == c_hi {
+                push_cell(&mut cells, &mut cell_has_text, row, c_lo, &span.text);
+                push_repl(&mut cells_repl, row, c_lo, &span.text);
+                if !line.all_bold {
+                    cell_is_bold[row][c_lo] = false;
+                }
+                continue;
+            }
+            // Multi-column span: replicate the full text into every covered
+            // cell of the colspan-semantics grid, and flag the row when the
+            // label is alpha-dominant (group headers are words; merged data
+            // runs are mostly digits).
+            for col in c_lo..=c_hi {
+                push_repl(&mut cells_repl, row, col, &span.text);
+            }
+            if is_alpha_dominant(&span.text) {
+                row_alpha_spanner[row] = true;
+            }
+            // Span crosses interior boundaries: split at the whitespace
+            // nearest each crossed boundary x (xs[k] is column k's left
+            // boundary, which is exactly the split target).
+            let covered: Vec<usize> = (c_lo..=c_hi).collect();
+            if let Some(pieces) = split_span_at_anchors(span, &covered, &xs) {
+                for (k, piece) in pieces.iter().enumerate() {
+                    push_cell(&mut cells, &mut cell_has_text, row, c_lo + k, piece);
+                    if !line.all_bold {
+                        cell_is_bold[row][c_lo + k] = false;
+                    }
+                }
+            } else {
+                // No whitespace to split on — assign whole span by center.
+                let cx = (span.x + span.width * 0.5).clamp(xs[0], xs[n_cols]);
+                if let Some(col) = find_bucket(&xs, cx) {
+                    push_cell(&mut cells, &mut cell_has_text, row, col, &span.text);
+                    if !line.all_bold {
+                        cell_is_bold[row][col] = false;
+                    }
+                }
+            }
         }
         consumed_indices.push(idx);
     }
 
     if consumed_indices.is_empty() {
+        if dbg {
+            eprintln!("[ruled]   REJECT no-lines-consumed");
+        }
         return None;
     }
 
@@ -2122,6 +2795,10 @@ fn build_ruled_table(
             has_text || row_heights[r] >= median_h * 0.8
         })
         .collect();
+    let kept_row_heights: Vec<f32> = (0..n_rows)
+        .filter(|r| keep[*r])
+        .map(|r| row_heights[r])
+        .collect();
     let cells: Vec<Vec<String>> = (0..n_rows)
         .filter(|r| keep[*r])
         .map(|r| cells[r].clone())
@@ -2134,8 +2811,19 @@ fn build_ruled_table(
         .filter(|r| keep[*r])
         .map(|r| cell_is_bold[r].clone())
         .collect();
+    let cells_repl: Vec<Vec<String>> = (0..n_rows)
+        .filter(|r| keep[*r])
+        .map(|r| cells_repl[r].clone())
+        .collect();
+    let row_alpha_spanner: Vec<bool> = (0..n_rows)
+        .filter(|r| keep[*r])
+        .map(|r| row_alpha_spanner[r])
+        .collect();
     let n_rows = cells.len();
     if n_rows < 2 {
+        if dbg {
+            eprintln!("[ruled]   REJECT rows-after-collapse {n_rows}");
+        }
         return None;
     }
 
@@ -2201,6 +2889,16 @@ fn build_ruled_table(
                 .collect()
         })
         .collect();
+    let cells_repl: Vec<Vec<String>> = cells_repl
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .enumerate()
+                .filter(|(c, _)| keep_col[*c])
+                .map(|(_, v)| v)
+                .collect()
+        })
+        .collect();
     let n_cols = cells.first().map(|r| r.len()).unwrap_or(0);
     if n_cols == 0 {
         return None;
@@ -2210,6 +2908,130 @@ fn build_ruled_table(
     if n_cols == 1 && n_rows < 3 {
         return None;
     }
+
+    // Colspan header-band flattening (Mode 5 / TRM): a sparse top row whose
+    // alpha spanning label covers several columns ("North America" over its
+    // Revenue/Units sub-columns) followed by a dense label row is a stacked
+    // header. Flatten rows 0..=b from the colspan-semantics grid into one
+    // header row (per-column top-to-bottom join), so each column carries its
+    // full layer chain ("North America Revenue") — that chain is what
+    // header-keyed evals (and readers) need.
+    let flattened_header: Option<(Vec<String>, usize)> = {
+        let row_fill =
+            |r: usize| cell_has_text[r].iter().filter(|t| **t).count() as f32 / n_cols as f32;
+        (0..n_rows).find(|r| row_fill(*r) >= 0.9).and_then(|b| {
+            let nonempty = cell_has_text[b].iter().filter(|t| **t).count();
+            let alpha_cells = (0..n_cols)
+                .filter(|c| cell_has_text[b][*c] && is_alpha_dominant(&cells[b][*c]))
+                .count();
+            // The bottom header layer may carry digit labels (years like
+            // "2024") but never measurement values. A decimal / % / $ /
+            // dash-placeholder / comma-grouped number in the anchor row means
+            // it's the first DATA row of a table whose real header just
+            // missed the 0.9-fill anchor (colspan header covering <90% of
+            // columns) — folding it would eat a data row (DS5795A_page4).
+            let has_value_cell =
+                (0..n_cols).any(|c| cell_has_text[b][c] && is_value_like(&cells[b][c]));
+            let qualifies = (1..=3).contains(&b)
+                && b + 1 < n_rows
+                && (0..b).any(|r| row_alpha_spanner[r])
+                && alpha_cells * 2 >= nonempty
+                && !has_value_cell;
+            if !qualifies {
+                return None;
+            }
+            let header: Vec<String> = (0..n_cols)
+                .map(|c| {
+                    let mut parts: Vec<&str> = Vec::new();
+                    for row in cells_repl.iter().take(b + 1) {
+                        let s = row[c].as_str();
+                        if s.is_empty() || parts.last() == Some(&s) {
+                            continue;
+                        }
+                        parts.push(s);
+                    }
+                    parts.join(" ")
+                })
+                .collect();
+            if header.iter().all(|h| h.is_empty()) {
+                return None;
+            }
+            if dbg {
+                eprintln!("[ruled]   colspan header flatten: rows 0..={b} -> {header:?}");
+            }
+            Some((header, b + 1))
+        })
+    };
+
+    // Stacked-header merge (Mode 5): some generators rule every text baseline
+    // of a wrapped header cell, slicing one logical header row into several
+    // thin sparse rows ("Rated" / "Voltage" / "(VDC)" each in its own band).
+    // When the top k≥2 rows are individually sparse but their union covers
+    // most columns AND a dense data row follows, collapse them into a single
+    // header row (per-column top-to-bottom join).
+    let (cells, cell_has_text, cell_is_bold, n_rows, merged_stacked_header) = {
+        let row_fill = |r: usize, has: &Vec<Vec<bool>>| {
+            has[r].iter().filter(|t| **t).count() as f32 / n_cols as f32
+        };
+        // Anchor on the first fully-dense row (the first real data row).
+        let k = (0..n_rows)
+            .find(|r| row_fill(*r, &cell_has_text) >= 0.9)
+            .unwrap_or(0);
+        let union_cols = (0..n_cols)
+            .filter(|c| (0..k).any(|r| cell_has_text[r][*c]))
+            .count();
+        // Tightness: the band rows must be noticeably shorter than the data
+        // rows below — ruled-per-baseline header bands sit at text leading
+        // (~7pt) while real rows carry cell padding. Without this, a table
+        // whose first body rows are legitimately sparse would get merged.
+        let band_tight = if k >= 2 && k < kept_row_heights.len() {
+            let mut below: Vec<f32> = kept_row_heights[k..].to_vec();
+            below.sort_by(|a, b| a.total_cmp(b));
+            let median_below = below[below.len() / 2];
+            kept_row_heights[..k]
+                .iter()
+                .all(|h| *h <= 0.75 * median_below)
+        } else {
+            false
+        };
+        if flattened_header.is_none()
+            && k >= 2
+            && k < n_rows
+            && band_tight
+            && union_cols as f32 >= 0.7 * n_cols as f32
+        {
+            if dbg {
+                eprintln!("[ruled]   stacked-header merge: top {k} rows → 1");
+            }
+            let mut merged_row = vec![String::new(); n_cols];
+            let mut merged_has = vec![false; n_cols];
+            let mut merged_bold = vec![true; n_cols];
+            for r in 0..k {
+                for c in 0..n_cols {
+                    if cell_has_text[r][c] {
+                        if !merged_row[c].is_empty() {
+                            merged_row[c].push(' ');
+                        }
+                        merged_row[c].push_str(&cells[r][c]);
+                        merged_has[c] = true;
+                        if !cell_is_bold[r][c] {
+                            merged_bold[c] = false;
+                        }
+                    }
+                }
+            }
+            let mut new_cells = vec![merged_row];
+            let mut new_has = vec![merged_has];
+            let mut new_bold = vec![merged_bold];
+            new_cells.extend(cells[k..].iter().cloned());
+            new_has.extend(cell_has_text[k..].iter().cloned());
+            new_bold.extend(cell_is_bold[k..].iter().cloned());
+            let nr = new_cells.len();
+            (new_cells, new_has, new_bold, nr, true)
+        } else {
+            (cells, cell_has_text, cell_is_bold, n_rows, false)
+        }
+    };
 
     let total = n_rows * n_cols;
     let empty_count = cell_has_text
@@ -2266,26 +3088,43 @@ fn build_ruled_table(
             && header_coverage >= 3
             && header_all_bold
             && dense_inner_col;
-        if !col0_spine && !long_prose_table {
+        // A fired colspan header flatten is table evidence on par with a
+        // label spine: it required a ≥0.9-fill alpha label row under an
+        // alpha spanning group label — decorative grids don't have that.
+        // Still subject to the WITH_SPINE ceiling below.
+        let flattened_evidence = flattened_header.is_some();
+        if !col0_spine && !long_prose_table && !flattened_evidence {
+            if dbg {
+                let fills: Vec<usize> = (0..n_rows)
+                    .map(|r| cell_has_text[r].iter().filter(|t| **t).count())
+                    .collect();
+                eprintln!(
+                    "[ruled]   REJECT empty-frac {empty_frac:.2} ({n_rows}x{n_cols}, no spine/long-prose) row_fills={fills:?}"
+                );
+            }
             return None;
         }
         if empty_frac > TABLE_MAX_EMPTY_CELL_FRACTION_WITH_SPINE && !long_prose_table {
+            if dbg {
+                eprintln!("[ruled]   REJECT empty-frac-with-spine {empty_frac:.2}");
+            }
             return None;
         }
     }
 
-    // Header = first row iff every non-empty cell in it is bold.
-    let header_qualifies = cell_has_text[0]
-        .iter()
-        .zip(cell_is_bold[0].iter())
-        .all(|(has, bold)| !has || *bold)
-        && cell_has_text[0].iter().any(|has| *has);
-    let header = if header_qualifies {
-        Some(cells[0].clone())
-    } else {
-        None
+    // Header preference order: flattened colspan band (carries the full
+    // per-column layer chain) > merged stacked-header band > bold first row.
+    let header_qualifies = merged_stacked_header
+        || (cell_has_text[0]
+            .iter()
+            .zip(cell_is_bold[0].iter())
+            .all(|(has, bold)| !has || *bold)
+            && cell_has_text[0].iter().any(|has| *has));
+    let (header, body_start) = match flattened_header {
+        Some((h, bs)) => (Some(h), bs),
+        None if header_qualifies => (Some(cells[0].clone()), 1),
+        None => (None, 0),
     };
-    let body_start = if header.is_some() { 1 } else { 0 };
     let body_rows: Vec<Vec<String>> = cells[body_start..].to_vec();
     if body_rows.is_empty() {
         return None;
@@ -2298,11 +3137,41 @@ fn build_ruled_table(
     Some(TableRun {
         start,
         end,
+        body_start: start,
         block: Block::Table {
             header,
             rows: body_rows,
         },
     })
+}
+
+/// Single-link cluster a sorted Vec of boundary coordinates, replacing each
+/// chain of entries (adjacent gap ≤ `tol`) with its mean. Unlike
+/// `dedup_close` (keep-first), the mean centers the boundary between the
+/// paired edges that cell-border rects produce (left border strip + right
+/// border strip of adjacent cells, typically 4-6pt apart), so the split
+/// target lands between cells rather than inside one.
+fn cluster_boundaries(v: &mut Vec<f32>, tol: f32) {
+    if v.len() < 2 {
+        return;
+    }
+    let mut out: Vec<f32> = Vec::with_capacity(v.len());
+    let mut cluster_sum = v[0];
+    let mut cluster_n = 1usize;
+    let mut last = v[0];
+    for &x in v.iter().skip(1) {
+        if x - last <= tol {
+            cluster_sum += x;
+            cluster_n += 1;
+        } else {
+            out.push(cluster_sum / cluster_n as f32);
+            cluster_sum = x;
+            cluster_n = 1;
+        }
+        last = x;
+    }
+    out.push(cluster_sum / cluster_n as f32);
+    *v = out;
 }
 
 /// In-place dedup of a sorted Vec, collapsing entries within `tol` to the
@@ -2792,6 +3661,7 @@ mod tests {
         let ruled = vec![TableRun {
             start: 5,
             end: 10,
+            body_start: 5,
             block: Block::Table {
                 header: None,
                 rows: vec![vec!["ruled".into()]],
@@ -2800,6 +3670,7 @@ mod tests {
         let borderless = vec![TableRun {
             start: 6,
             end: 11,
+            body_start: 6,
             block: Block::GridFallback {
                 lines: vec!["bl".into()],
             },
@@ -2850,6 +3721,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -2858,6 +3730,7 @@ mod tests {
         let b = TableRun {
             start: 2,
             end: 5,
+            body_start: 2,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -2896,6 +3769,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -2907,6 +3781,7 @@ mod tests {
         let b = TableRun {
             start: 2,
             end: 5,
+            body_start: 2,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -2946,6 +3821,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -2954,6 +3830,7 @@ mod tests {
         let b = TableRun {
             start: 2,
             end: 4,
+            body_start: 2,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -2977,6 +3854,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 10,
+            body_start: 0,
             block: Block::Table {
                 header: None,
                 rows: (0..10)
@@ -2987,6 +3865,7 @@ mod tests {
         let b = TableRun {
             start: 10,
             end: 13,
+            body_start: 10,
             block: Block::Table {
                 header: None,
                 rows: (0..3)
@@ -3031,6 +3910,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -3042,6 +3922,7 @@ mod tests {
         let b = TableRun {
             start: 2,
             end: 4,
+            body_start: 2,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -3064,6 +3945,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -3075,6 +3957,7 @@ mod tests {
         let b = TableRun {
             start: 2,
             end: 3,
+            body_start: 2,
             block: Block::GridFallback {
                 lines: vec!["fallback".into()],
             },
@@ -3106,6 +3989,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: Some(vec!["A".into(), "B".into(), "C".into()]),
                 rows: vec![vec!["1".into(), "2".into(), "3".into()]],
@@ -3114,6 +3998,7 @@ mod tests {
         let b = TableRun {
             start: 3,
             end: 5,
+            body_start: 3,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -3142,6 +4027,7 @@ mod tests {
         let a = TableRun {
             start: 0,
             end: 2,
+            body_start: 0,
             block: Block::Table {
                 header: None,
                 rows: vec![
@@ -3153,6 +4039,7 @@ mod tests {
         let b = TableRun {
             start: 3,
             end: 6,
+            body_start: 3,
             block: Block::Table {
                 header: None,
                 rows: vec![

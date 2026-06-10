@@ -1,4 +1,5 @@
 use crate::error::LiteParseError;
+use crate::glyph_names::resolve_glyph_name;
 use crate::render::encode_png;
 use crate::types::{
     ExtractedImage, GraphicPrimitive, ImageRef, OutlineTarget, Page as LitePage, PdfInput, Rect,
@@ -411,19 +412,16 @@ fn extract_page_text_items(
     let vp_xform = page.viewport_transform(view_box);
     let mut items: Vec<TextItem> = Vec::new();
     let mut seg = SegmentBuilder::new();
+    let garbage_fonts = detect_garbage_unicode_fonts(text_page, char_count);
+    let mut glyph_decoder = GlyphDecoder::new(
+        std::env::var("LITEPARSE_DEBUG_GLYPH").is_ok(),
+        garbage_fonts,
+    );
 
     for i in 0..char_count {
         let ch = text_page.char_at_unchecked(i);
         let unicode = ch.unicode();
         let is_generated = ch.is_generated();
-
-        // Skip null / invalid sentinels
-        if unicode == 0 || unicode == 0xFFFE || unicode == 0xFFFF {
-            if debug {
-                eprintln!("[extract-debug] i={i} SKIP sentinel unicode=0x{unicode:04X}");
-            }
-            continue;
-        }
 
         // Skip invisible text (render mode 3) only when the page also has visible text.
         // If all text is invisible, it's likely an OCR text layer and we should keep it.
@@ -437,26 +435,47 @@ fn extract_page_text_items(
             continue;
         }
 
+        // Glyph-name recovery: when the font's unicode mapping is missing or
+        // untrusted, resolve the charcode's PostScript glyph name instead.
+        let decoded: Option<&str> = if is_generated {
+            None
+        } else {
+            glyph_decoder.decode(&ch, unicode)
+        };
+
+        // Skip null / invalid sentinels (unless the glyph name recovered them)
+        if decoded.is_none() && (unicode == 0 || unicode == 0xFFFE || unicode == 0xFFFF) {
+            if debug {
+                eprintln!("[extract-debug] i={i} SKIP sentinel unicode=0x{unicode:04X}");
+            }
+            continue;
+        }
+
         // Map to a Rust char, with special-case replacements.
         // Some PDF fonts encode ligatures as control characters; expand them.
         // We use the first char for segment decisions, then append trailing chars.
-        let (c, ligature_tail): (char, &str) = match unicode {
-            0x02 => ('-', ""),   // STX → hyphen (common in some PDF encodings)
-            0x1A => ('f', "f"),  // ff ligature
-            0x1B => ('f', "t"),  // ft ligature
-            0x1C => ('f', "i"),  // fi ligature
-            0x1D => ('T', "h"),  // Th ligature
-            0x1E => ('f', "fi"), // ffi ligature
-            0x1F => ('f', "l"),  // fl ligature
-            _ => match char::from_u32(unicode) {
-                Some(ch_mapped) => (ch_mapped, ""),
-                None => {
-                    if debug {
-                        eprintln!("[extract-debug] i={i} SKIP invalid unicode=0x{unicode:04X}");
+        let (c, ligature_tail): (char, &str) = if let Some(s) = decoded {
+            let mut it = s.chars();
+            (it.next().unwrap(), it.as_str())
+        } else {
+            match unicode {
+                0x02 => ('-', ""),   // STX → hyphen (common in some PDF encodings)
+                0x1A => ('f', "f"),  // ff ligature
+                0x1B => ('f', "t"),  // ft ligature
+                0x1C => ('f', "i"),  // fi ligature
+                0x1D => ('T', "h"),  // Th ligature
+                0x1E => ('f', "fi"), // ffi ligature
+                0x1F => ('f', "l"),  // fl ligature
+                _ => match char::from_u32(unicode) {
+                    Some(ch_mapped) => (ch_mapped, ""),
+                    None => {
+                        if debug {
+                            eprintln!("[extract-debug] i={i} SKIP invalid unicode=0x{unicode:04X}");
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            },
+                },
+            }
         };
         let c = normalize_punct(c);
 
@@ -847,6 +866,226 @@ fn is_buggy_codepoint(unicode: u32) -> bool {
 
 fn color_to_argb_hex(c: &pdfium::Color) -> String {
     format!("{:02x}{:02x}{:02x}{:02x}", c.a, c.r, c.g, c.b)
+}
+
+/// Per-page glyph-name-based unicode recovery (fork API).
+///
+/// When a font has no /ToUnicode CMap, PDFium derives unicode from the
+/// encoding alone — garbage for custom/Identity encodings (Mode 10 glyph
+/// soup), and guessed control-code expansions for ligatures (Mode 16). The
+/// PostScript glyph name the font assigns to the charcode (from /Encoding
+/// /Differences or the embedded font program) resolved against the Adobe
+/// Glyph List is the authoritative signal in both cases.
+struct GlyphDecoder {
+    fonts: std::collections::HashMap<usize, FontGlyphInfo>,
+    /// Chars arrive in runs per text object; cache the last object's font key
+    /// to skip the FPDFTextObj_GetFont FFI call on the common path.
+    last_obj: usize,
+    last_key: usize,
+    /// Font handles whose /ToUnicode the prescan flagged as garbage (high
+    /// fraction of control/PUA unicodes across the page).
+    garbage_fonts: std::collections::HashSet<usize>,
+    debug: bool,
+    /// Kill-switch for A/B benching: LITEPARSE_DISABLE_GLYPH_NAMES=1
+    disabled: bool,
+}
+
+struct FontGlyphInfo {
+    font: Font,
+    /// No /ToUnicode and no standard base encoding (or the prescan flagged
+    /// the ToUnicode as garbage): PDFium's unicode values for this font are
+    /// untrusted, so every charcode gets a recovery try.
+    untrusted: bool,
+    /// charcode → resolved replacement text (None = unrecoverable)
+    cache: std::collections::HashMap<u32, Option<String>>,
+    /// Lazily-built glyph_index → unicode map from the embedded font
+    /// program's cmap table (None = not yet built, Some(None) = unavailable).
+    reverse_cmap: Option<Option<std::collections::HashMap<u32, u32>>>,
+}
+
+impl GlyphDecoder {
+    fn new(debug: bool, garbage_fonts: std::collections::HashSet<usize>) -> Self {
+        Self {
+            fonts: std::collections::HashMap::new(),
+            garbage_fonts,
+            last_obj: 0,
+            last_key: 0,
+            debug,
+            disabled: std::env::var("LITEPARSE_DISABLE_GLYPH_NAMES").is_ok(),
+        }
+    }
+
+    /// Returns replacement text for this char when its glyph name resolves
+    /// and the current unicode is suspicious (control/PUA/sentinel/map-error)
+    /// or the font's unicode mapping is untrusted altogether.
+    fn decode(&mut self, ch: &pdfium::TextChar, unicode: u32) -> Option<&str> {
+        if self.disabled {
+            return None;
+        }
+        let cheap_suspicious = matches!(unicode, 0 | 0xFFFE | 0xFFFF)
+            || (unicode < 0x20 && !matches!(unicode, 0x09 | 0x0A | 0x0D))
+            || (0xE000..=0xF8FF).contains(&unicode);
+
+        let obj_ptr = ch.text_object()?;
+        let obj = obj_ptr as usize;
+        let key = if obj == self.last_obj {
+            self.last_key
+        } else {
+            let font = unsafe { Font::from_text_object(obj_ptr) }?;
+            let key = font.handle() as usize;
+            let debug = self.debug;
+            let garbage = self.garbage_fonts.contains(&key);
+            self.fonts.entry(key).or_insert_with(|| {
+                let has_to_unicode = font.has_to_unicode();
+                let encoding = font.encoding();
+                let untrusted = garbage
+                    || (!has_to_unicode
+                        && !matches!(
+                            encoding.as_deref(),
+                            Some("WinAnsiEncoding")
+                                | Some("MacRomanEncoding")
+                                | Some("MacExpertEncoding")
+                                | Some("StandardEncoding")
+                        ));
+                if debug {
+                    eprintln!(
+                        "[glyph] font={:?} to_unicode={} encoding={:?} garbage={} untrusted={}",
+                        font.base_name(),
+                        has_to_unicode,
+                        encoding,
+                        garbage,
+                        untrusted
+                    );
+                }
+                FontGlyphInfo {
+                    font,
+                    untrusted,
+                    cache: std::collections::HashMap::new(),
+                    reverse_cmap: None,
+                }
+            });
+            self.last_obj = obj;
+            self.last_key = key;
+            key
+        };
+        let info = self.fonts.get_mut(&key)?;
+
+        // map-error FFI check is the expensive part of "suspicious"; only
+        // consult it when the cheap checks and font trust don't decide.
+        if !info.untrusted && !cheap_suspicious && !ch.has_unicode_map_error() {
+            return None;
+        }
+        let debug = self.debug;
+
+        let char_code = ch.char_code();
+        let FontGlyphInfo {
+            font,
+            cache,
+            reverse_cmap,
+            ..
+        } = info;
+        cache
+            .entry(char_code)
+            .or_insert_with(|| {
+                let name = font.char_glyph_name(char_code);
+                let resolved = name
+                    .as_deref()
+                    .and_then(resolve_glyph_name)
+                    .filter(|r| r.chars().all(|c| !c.is_control()));
+                // Fallback: reverse-map the glyph index through the embedded
+                // font program's own cmap table.
+                let resolved = resolved.or_else(|| {
+                    let glyph = font.char_glyph_index(char_code)?;
+                    let map = reverse_cmap
+                        .get_or_insert_with(|| {
+                            let data = font.font_data();
+                            let map = data.as_deref().and_then(crate::font_cmap::reverse_cmap);
+                            if debug {
+                                eprintln!(
+                                    "[glyph] reverse_cmap build: data={:?} bytes, entries={:?}",
+                                    data.as_ref().map(|d| d.len()),
+                                    map.as_ref().map(|m| m.len())
+                                );
+                            }
+                            map
+                        })
+                        .as_ref()?;
+                    let u = *map.get(&glyph)?;
+                    if (0xE000..=0xF8FF).contains(&u) {
+                        return None;
+                    }
+                    // Synthetic subset cmaps just echo the charcode back
+                    // (charcode-identity, not semantic unicode). A recovery
+                    // that "resolves" to the charcode itself is that
+                    // signature, not a real mapping — keep PDFium's value.
+                    if u == char_code && u != unicode {
+                        return None;
+                    }
+                    let c = char::from_u32(u).filter(|c| !c.is_control())?;
+                    Some(match crate::glyph_names::presentation_form_expansion(c) {
+                        Some(s) => s.to_string(),
+                        None => c.to_string(),
+                    })
+                });
+                if debug {
+                    eprintln!(
+                        "[glyph] cc=0x{char_code:04X} unicode=0x{unicode:04X} name={name:?} -> {resolved:?}"
+                    );
+                }
+                resolved
+            })
+            .as_deref()
+    }
+}
+
+/// Prescan: flag fonts whose /ToUnicode maps a high fraction of chars into
+/// control/PUA/sentinel codepoints — a structurally present but garbage CMap
+/// (e.g. `text_simple__spd`). Chars from flagged fonts get glyph-name /
+/// reverse-cmap recovery even when their individual unicode looks plausible.
+fn detect_garbage_unicode_fonts(
+    text_page: &TextPage,
+    char_count: i32,
+) -> std::collections::HashSet<usize> {
+    let mut counts: std::collections::HashMap<usize, (u32, u32)> = std::collections::HashMap::new();
+    let mut last_obj: usize = 0;
+    let mut last_key: usize = 0;
+    for i in 0..char_count {
+        let ch = text_page.char_at_unchecked(i);
+        if ch.is_generated() {
+            continue;
+        }
+        let unicode = ch.unicode();
+        if matches!(unicode, 0x09 | 0x0A | 0x0D | 0x20) {
+            continue;
+        }
+        let Some(obj_ptr) = ch.text_object() else {
+            continue;
+        };
+        let obj = obj_ptr as usize;
+        let key = if obj == last_obj {
+            last_key
+        } else {
+            let Some(font) = (unsafe { Font::from_text_object(obj_ptr) }) else {
+                continue;
+            };
+            last_obj = obj;
+            last_key = font.handle() as usize;
+            last_key
+        };
+        let entry = counts.entry(key).or_insert((0, 0));
+        entry.0 += 1;
+        let suspicious = matches!(unicode, 0 | 0xFFFE | 0xFFFF)
+            || unicode < 0x20
+            || (0xE000..=0xF8FF).contains(&unicode);
+        if suspicious {
+            entry.1 += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|&(_, (total, suspicious))| total >= 20 && suspicious * 10 >= total)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// Accumulates characters into a single TextItem segment.

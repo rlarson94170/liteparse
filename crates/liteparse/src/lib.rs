@@ -27,6 +27,10 @@ pub mod extract;
 #[doc(hidden)]
 pub mod figure_cluster;
 #[doc(hidden)]
+pub mod font_cmap;
+#[doc(hidden)]
+pub mod glyph_names;
+#[doc(hidden)]
 pub mod markdown_layout;
 #[doc(hidden)]
 pub mod ocr;

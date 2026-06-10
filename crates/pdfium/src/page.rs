@@ -279,127 +279,201 @@ impl Page<'_> {
 
     /// Enumerate vector path objects on this page. Segment points are
     /// transformed into viewport space (top-left origin, 72 DPI) by composing
-    /// the object's matrix with the page→viewport transform.
+    /// the object's matrix with the page→viewport transform. Recurses into
+    /// Form XObjects (composing each form's matrix) — table rules and other
+    /// vector art are frequently wrapped in a form container, invisible to a
+    /// top-level-only walk.
     pub fn path_objects(&self, view_box: &RectF) -> Vec<PathObject> {
         let vp = self.viewport_transform(view_box);
         let obj_count = unsafe { ffi!(FPDFPage_CountObjects(self.handle)) };
         let mut out = Vec::new();
+        let identity = pdfium_sys::FS_MATRIX {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        };
 
         for i in 0..obj_count {
             let obj = unsafe { ffi!(FPDFPage_GetObject(self.handle, i)) };
             if obj.is_null() {
                 continue;
             }
-            let obj_type = unsafe { ffi!(FPDFPageObj_GetType(obj)) };
-            if obj_type != pdfium_sys::FPDF_PAGEOBJ_PATH as i32 {
-                continue;
-            }
-
-            // Object → page matrix. Defaults to identity when not available.
-            let mut m = pdfium_sys::FS_MATRIX {
-                a: 1.0,
-                b: 0.0,
-                c: 0.0,
-                d: 1.0,
-                e: 0.0,
-                f: 0.0,
-            };
-            unsafe { ffi!(FPDFPageObj_GetMatrix(obj, &mut m)) };
-
-            // Bounds are reported in page space already accounting for the
-            // matrix — just lift to viewport.
-            let mut left = 0.0f32;
-            let mut bottom = 0.0f32;
-            let mut right = 0.0f32;
-            let mut top = 0.0f32;
-            let ok = unsafe {
-                ffi!(FPDFPageObj_GetBounds(
-                    obj,
-                    &mut left,
-                    &mut bottom,
-                    &mut right,
-                    &mut top
-                ))
-            };
-            if ok == 0 {
-                continue;
-            }
-            let bbox = vp.transform_bounds(&RectF {
-                left,
-                top,
-                right,
-                bottom,
-            });
-
-            // Draw mode → is_filled / is_stroked.
-            let mut fill_mode = 0i32;
-            let mut stroke_bool = 0i32;
-            let dm_ok =
-                unsafe { ffi!(FPDFPath_GetDrawMode(obj, &mut fill_mode, &mut stroke_bool)) };
-            let (is_filled, is_stroked) = if dm_ok != 0 {
-                (
-                    fill_mode != pdfium_sys::FPDF_FILLMODE_NONE as i32,
-                    stroke_bool != 0,
-                )
-            } else {
-                (false, false)
-            };
-
-            // Colors are reported as RGBA channels in 0..=255 cuint.
-            let stroke_color = read_color(|r, g, b, a| unsafe {
-                ffi!(FPDFPageObj_GetStrokeColor(obj, r, g, b, a))
-            });
-            let fill_color =
-                read_color(|r, g, b, a| unsafe { ffi!(FPDFPageObj_GetFillColor(obj, r, g, b, a)) });
-
-            let mut stroke_width = 0.0f32;
-            unsafe { ffi!(FPDFPageObj_GetStrokeWidth(obj, &mut stroke_width)) };
-
-            // Walk segments. Points are in the object's local coords; apply
-            // matrix → page, then viewport transform.
-            let n_segs = unsafe { ffi!(FPDFPath_CountSegments(obj)) };
-            let mut segments = Vec::with_capacity(n_segs.max(0) as usize);
-            for si in 0..n_segs {
-                let seg = unsafe { ffi!(FPDFPath_GetPathSegment(obj, si)) };
-                if seg.is_null() {
-                    continue;
-                }
-                let mut sx = 0.0f32;
-                let mut sy = 0.0f32;
-                let pt_ok = unsafe { ffi!(FPDFPathSegment_GetPoint(seg, &mut sx, &mut sy)) };
-                if pt_ok == 0 {
-                    continue;
-                }
-                let ty = unsafe { ffi!(FPDFPathSegment_GetType(seg)) };
-                let close = unsafe { ffi!(FPDFPathSegment_GetClose(seg)) } != 0;
-                let kind = match ty as u32 {
-                    pdfium_sys::FPDF_SEGMENT_MOVETO => SegmentKind::MoveTo,
-                    pdfium_sys::FPDF_SEGMENT_LINETO => SegmentKind::LineTo,
-                    pdfium_sys::FPDF_SEGMENT_BEZIERTO => SegmentKind::BezierTo,
-                    _ => continue,
-                };
-
-                // Apply object matrix (FS_MATRIX is column-major a/b/c/d/e/f
-                // matching the PDF text-matrix convention used elsewhere).
-                let page_x = m.a * sx + m.c * sy + m.e;
-                let page_y = m.b * sx + m.d * sy + m.f;
-                let (x, y) = vp.transform_point(page_x, page_y);
-                segments.push(PathSegment { kind, x, y, close });
-            }
-
-            out.push(PathObject {
-                bbox,
-                stroke_color,
-                fill_color,
-                stroke_width,
-                is_stroked,
-                is_filled,
-                segments,
-            });
+            collect_path_objects(obj, &identity, &vp, 0, &mut out);
         }
-
         out
     }
+}
+
+const FS_IDENTITY: pdfium_sys::FS_MATRIX = pdfium_sys::FS_MATRIX {
+    a: 1.0,
+    b: 0.0,
+    c: 0.0,
+    d: 1.0,
+    e: 0.0,
+    f: 0.0,
+};
+
+/// Compose two affine matrices: `result(p) = outer(inner(p))`.
+fn compose_matrix(
+    outer: &pdfium_sys::FS_MATRIX,
+    inner: &pdfium_sys::FS_MATRIX,
+) -> pdfium_sys::FS_MATRIX {
+    pdfium_sys::FS_MATRIX {
+        a: outer.a * inner.a + outer.c * inner.b,
+        b: outer.b * inner.a + outer.d * inner.b,
+        c: outer.a * inner.c + outer.c * inner.d,
+        d: outer.b * inner.c + outer.d * inner.d,
+        e: outer.a * inner.e + outer.c * inner.f + outer.e,
+        f: outer.b * inner.e + outer.d * inner.f + outer.f,
+    }
+}
+
+/// Recursively collect path objects, descending into Form XObjects. `parent`
+/// is the accumulated form matrix mapping this object's content space into
+/// page space (identity at the top level).
+fn collect_path_objects(
+    obj: pdfium_sys::FPDF_PAGEOBJECT,
+    parent: &pdfium_sys::FS_MATRIX,
+    vp: &ViewportTransform,
+    depth: usize,
+    out: &mut Vec<PathObject>,
+) {
+    const MAX_FORM_DEPTH: usize = 6;
+    let obj_type = unsafe { ffi!(FPDFPageObj_GetType(obj)) };
+
+    if obj_type == pdfium_sys::FPDF_PAGEOBJ_FORM as i32 {
+        if depth >= MAX_FORM_DEPTH {
+            return;
+        }
+        let mut fm = FS_IDENTITY;
+        unsafe { ffi!(FPDFPageObj_GetMatrix(obj, &mut fm)) };
+        let combined = compose_matrix(parent, &fm);
+        let n = unsafe { ffi!(FPDFFormObj_CountObjects(obj)) };
+        for i in 0..n {
+            let child = unsafe { ffi!(FPDFFormObj_GetObject(obj, i as std::os::raw::c_ulong)) };
+            if child.is_null() {
+                continue;
+            }
+            collect_path_objects(child, &combined, vp, depth + 1, out);
+        }
+        return;
+    }
+
+    if obj_type != pdfium_sys::FPDF_PAGEOBJ_PATH as i32 {
+        return;
+    }
+
+    // Object → content-space matrix, composed with the accumulated form
+    // matrix to reach page space.
+    let mut m = FS_IDENTITY;
+    unsafe { ffi!(FPDFPageObj_GetMatrix(obj, &mut m)) };
+    let m = compose_matrix(parent, &m);
+
+    // GetBounds reports bounds in the object's content-stream space (its own
+    // matrix applied, ancestor form matrices not). Lift the corners through
+    // the parent matrix, then to viewport.
+    let mut left = 0.0f32;
+    let mut bottom = 0.0f32;
+    let mut right = 0.0f32;
+    let mut top = 0.0f32;
+    let ok = unsafe {
+        ffi!(FPDFPageObj_GetBounds(
+            obj,
+            &mut left,
+            &mut bottom,
+            &mut right,
+            &mut top
+        ))
+    };
+    if ok == 0 {
+        return;
+    }
+    let corners = [(left, bottom), (left, top), (right, bottom), (right, top)];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let px = parent.a * x + parent.c * y + parent.e;
+        let py = parent.b * x + parent.d * y + parent.f;
+        min_x = min_x.min(px);
+        max_x = max_x.max(px);
+        min_y = min_y.min(py);
+        max_y = max_y.max(py);
+    }
+    let bbox = vp.transform_bounds(&RectF {
+        left: min_x,
+        top: max_y,
+        right: max_x,
+        bottom: min_y,
+    });
+
+    // Draw mode → is_filled / is_stroked.
+    let mut fill_mode = 0i32;
+    let mut stroke_bool = 0i32;
+    let dm_ok = unsafe { ffi!(FPDFPath_GetDrawMode(obj, &mut fill_mode, &mut stroke_bool)) };
+    let (is_filled, is_stroked) = if dm_ok != 0 {
+        (
+            fill_mode != pdfium_sys::FPDF_FILLMODE_NONE as i32,
+            stroke_bool != 0,
+        )
+    } else {
+        (false, false)
+    };
+
+    // Colors are reported as RGBA channels in 0..=255 cuint.
+    let stroke_color =
+        read_color(|r, g, b, a| unsafe { ffi!(FPDFPageObj_GetStrokeColor(obj, r, g, b, a)) });
+    let fill_color =
+        read_color(|r, g, b, a| unsafe { ffi!(FPDFPageObj_GetFillColor(obj, r, g, b, a)) });
+
+    let mut stroke_width = 0.0f32;
+    unsafe { ffi!(FPDFPageObj_GetStrokeWidth(obj, &mut stroke_width)) };
+
+    // Walk segments. Points are in the object's local coords; apply the
+    // composed matrix → page, then viewport transform.
+    let n_segs = unsafe { ffi!(FPDFPath_CountSegments(obj)) };
+    let mut segments = Vec::with_capacity(n_segs.max(0) as usize);
+    for si in 0..n_segs {
+        let seg = unsafe { ffi!(FPDFPath_GetPathSegment(obj, si)) };
+        if seg.is_null() {
+            continue;
+        }
+        let mut sx = 0.0f32;
+        let mut sy = 0.0f32;
+        let pt_ok = unsafe { ffi!(FPDFPathSegment_GetPoint(seg, &mut sx, &mut sy)) };
+        if pt_ok == 0 {
+            continue;
+        }
+        let ty = unsafe { ffi!(FPDFPathSegment_GetType(seg)) };
+        let close = unsafe { ffi!(FPDFPathSegment_GetClose(seg)) } != 0;
+        let kind = match ty as u32 {
+            pdfium_sys::FPDF_SEGMENT_MOVETO => SegmentKind::MoveTo,
+            pdfium_sys::FPDF_SEGMENT_LINETO => SegmentKind::LineTo,
+            pdfium_sys::FPDF_SEGMENT_BEZIERTO => SegmentKind::BezierTo,
+            _ => continue,
+        };
+
+        // Apply the composed matrix (FS_MATRIX is column-major a/b/c/d/e/f
+        // matching the PDF text-matrix convention used elsewhere).
+        let page_x = m.a * sx + m.c * sy + m.e;
+        let page_y = m.b * sx + m.d * sy + m.f;
+        let (x, y) = vp.transform_point(page_x, page_y);
+        segments.push(PathSegment { kind, x, y, close });
+    }
+
+    out.push(PathObject {
+        bbox,
+        stroke_color,
+        fill_color,
+        stroke_width,
+        is_stroked,
+        is_filled,
+        segments,
+    });
 }
 
 /// Helper: call a PDFium getter for RGBA color channels and pack into our `Color`.

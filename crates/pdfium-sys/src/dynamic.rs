@@ -93,6 +93,9 @@ pub struct PdfiumBindings {
         *mut std::os::raw::c_int,
         *mut FPDF_BOOL,
     ) -> FPDF_BOOL,
+    pub FPDFFormObj_CountObjects: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
+    pub FPDFFormObj_GetObject:
+        unsafe extern "C" fn(FPDF_PAGEOBJECT, std::os::raw::c_ulong) -> FPDF_PAGEOBJECT,
     pub FPDFPath_CountSegments: unsafe extern "C" fn(FPDF_PAGEOBJECT) -> std::os::raw::c_int,
     pub FPDFPath_GetPathSegment:
         unsafe extern "C" fn(FPDF_PAGEOBJECT, std::os::raw::c_int) -> FPDF_PATHSEGMENT,
@@ -230,6 +233,21 @@ pub struct PdfiumBindings {
     pub FPDFFont_GetGlyphWidth: unsafe extern "C" fn(FPDF_FONT, u32, f32, *mut f32) -> FPDF_BOOL,
     pub FPDFFont_GetGlyphWidthFromCharCode:
         unsafe extern "C" fn(FPDF_FONT, u32, f32, *mut f32) -> FPDF_BOOL,
+    pub FPDFFont_HasToUnicode: unsafe extern "C" fn(FPDF_FONT) -> FPDF_BOOL,
+    pub FPDFFont_GetCharGlyphName: unsafe extern "C" fn(
+        FPDF_FONT,
+        u32,
+        *mut std::os::raw::c_char,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFFont_GetEncoding: unsafe extern "C" fn(
+        FPDF_FONT,
+        *mut std::os::raw::c_char,
+        std::os::raw::c_ulong,
+    ) -> std::os::raw::c_ulong,
+    pub FPDFFont_GetCharGlyphIndex: unsafe extern "C" fn(FPDF_FONT, u32) -> std::os::raw::c_int,
+    pub FPDFFont_GetFontData:
+        unsafe extern "C" fn(FPDF_FONT, *mut u8, usize, *mut usize) -> FPDF_BOOL,
 
     // -- Outline (bookmarks) --
     pub FPDFBookmark_GetFirstChild:
@@ -324,6 +342,8 @@ impl PdfiumBindings {
             FPDFPageObj_GetFillColor: load_fn!(lib, "FPDFPageObj_GetFillColor"),
             FPDFPageObj_GetStrokeWidth: load_fn!(lib, "FPDFPageObj_GetStrokeWidth"),
             FPDFPath_GetDrawMode: load_fn!(lib, "FPDFPath_GetDrawMode"),
+            FPDFFormObj_CountObjects: load_fn!(lib, "FPDFFormObj_CountObjects"),
+            FPDFFormObj_GetObject: load_fn!(lib, "FPDFFormObj_GetObject"),
             FPDFPath_CountSegments: load_fn!(lib, "FPDFPath_CountSegments"),
             FPDFPath_GetPathSegment: load_fn!(lib, "FPDFPath_GetPathSegment"),
             FPDFPathSegment_GetPoint: load_fn!(lib, "FPDFPathSegment_GetPoint"),
@@ -367,6 +387,11 @@ impl PdfiumBindings {
             FPDFFont_GetDescent: load_fn!(lib, "FPDFFont_GetDescent"),
             FPDFFont_GetGlyphWidth: load_fn!(lib, "FPDFFont_GetGlyphWidth"),
             FPDFFont_GetGlyphWidthFromCharCode: load_fn!(lib, "FPDFFont_GetGlyphWidthFromCharCode"),
+            FPDFFont_HasToUnicode: load_fn!(lib, "FPDFFont_HasToUnicode"),
+            FPDFFont_GetCharGlyphName: load_fn!(lib, "FPDFFont_GetCharGlyphName"),
+            FPDFFont_GetEncoding: load_fn!(lib, "FPDFFont_GetEncoding"),
+            FPDFFont_GetCharGlyphIndex: load_fn!(lib, "FPDFFont_GetCharGlyphIndex"),
+            FPDFFont_GetFontData: load_fn!(lib, "FPDFFont_GetFontData"),
 
             FPDFBookmark_GetFirstChild: load_fn!(lib, "FPDFBookmark_GetFirstChild"),
             FPDFBookmark_GetNextSibling: load_fn!(lib, "FPDFBookmark_GetNextSibling"),

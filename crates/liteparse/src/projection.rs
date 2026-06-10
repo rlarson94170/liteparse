@@ -2971,7 +2971,7 @@ const XY_COLUMN_PEAK_BALANCE_RATIO: f32 = 0.4;
 /// detector) on sparse tabular layouts.
 const XY_COLUMN_MIN_FILL: f32 = 0.55;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct CutCandidate {
     axis: CutAxis,
     /// Coordinate of the split (y for horizontal cut, x for vertical).
@@ -3309,6 +3309,7 @@ fn xy_find_column_cut(
     idxs: &[usize],
     bbox: &Rect,
     median_h: f32,
+    tabular: &mut bool,
 ) -> Option<CutCandidate> {
     let dbg = std::env::var("LITEPARSE_DEBUG_XY").is_ok();
     macro_rules! reject {
@@ -3598,9 +3599,11 @@ fn xy_find_column_cut(
             }
             const MIN_FILL_HARD_FLOOR: f32 = 0.38;
             if min_fill.is_finite() && min_fill < MIN_FILL_HARD_FLOOR {
+                *tabular = true;
                 reject!("N-column min fill {min_fill:.2} < {MIN_FILL_HARD_FLOOR} (tabular column)");
             }
             if avg_fill.is_finite() && avg_fill < XY_COLUMN_MIN_FILL {
+                *tabular = true;
                 reject!(
                     "N-column avg fill {avg_fill:.2} < {} (tabular)",
                     XY_COLUMN_MIN_FILL
@@ -3724,7 +3727,10 @@ fn column_cut_x(
     figures: &[Rect],
 ) -> Option<f32> {
     xy_find_best_cut(items, idxs, bbox, CutAxis::Vertical, median_h, figures)
-        .or_else(|| xy_find_column_cut(items, idxs, bbox, median_h))
+        .or_else(|| {
+            let mut tabular = false;
+            xy_find_column_cut(items, idxs, bbox, median_h, &mut tabular)
+        })
         .map(|c| c.position)
 }
 
@@ -3871,8 +3877,15 @@ fn xy_cut_rec(
     // figure-straddle layouts) where the column structure is real but the
     // density projection can't see it. If either density cut found a
     // valley, trust it instead of firing the histogram fallback.
+    // Run the histogram probe unconditionally: besides being a fallback cut
+    // source, its fill gate is the region-level table detector — when it
+    // rejects with "tabular", density V-cuts must not slice the table's
+    // inter-column gutters either (the dominant column-major-table failure:
+    // SERFF_CA page2024 et al).
+    let mut region_tabular = false;
+    let column_full = xy_find_column_cut(items, &idxs, &bbox, median_h, &mut region_tabular);
     let column = if v.is_none() && h.is_none() {
-        xy_find_column_cut(items, &idxs, &bbox, median_h)
+        column_full
     } else {
         None
     };
@@ -3894,7 +3907,7 @@ fn xy_cut_rec(
         // Also probe what the column histogram WOULD return if we ran it
         // unconditionally — this is the diagnostic that tells us whether
         // reordering V/H/column priority would unlock more column splits.
-        let column_probe = xy_find_column_cut(items, &idxs, &bbox, median_h);
+        let column_probe = column_full;
         let pad = "  ".repeat(depth as usize);
         let fmt = |c: &Option<CutCandidate>| {
             c.as_ref()
@@ -3952,6 +3965,18 @@ fn xy_cut_rec(
     // margin (e.g. peeling a 1-line footer) trips the min-lines guard and
     // collapses the whole region to a single leaf — masking the real
     // column structure the V-cut would have revealed.
+    // When the histogram fill gate classified this region as tabular, a
+    // density V valley here is a table gutter, not a column boundary —
+    // suppress it so the table reaches the table detectors row-major.
+    let v = if region_tabular && std::env::var("LITEPARSE_DISABLE_TABULAR_V_SUPPRESS").is_err() {
+        if debug_xy && v.is_some() {
+            let pad = "  ".repeat(depth as usize);
+            eprintln!("[xy d={depth}]{pad} -> SUPPRESS density V (region tabular)");
+        }
+        None
+    } else {
+        v
+    };
     if prefer_h_over_v {
         if let Some(hc) = h {
             candidates.push(hc);
@@ -3967,14 +3992,14 @@ fn xy_cut_rec(
             candidates.push(hc);
         }
     }
-    // Final fallback: unconditional column-histogram probe. Skipped when
-    // an existing candidate is already a histogram-derived column cut
-    // (score = 1.0e9 from `xy_find_column_cut`).
+    // Final fallback: re-use the unconditional column-histogram probe.
+    // Skipped when an existing candidate is already a histogram-derived
+    // column cut (score = 1.0e9 from `xy_find_column_cut`).
     if !candidates
         .iter()
         .any(|c| c.axis == CutAxis::Vertical && (c.score - 1.0e9).abs() < 1.0)
     {
-        if let Some(cp) = xy_find_column_cut(items, &idxs, &bbox, median_h) {
+        if let Some(cp) = column_full {
             candidates.push(cp);
         }
     }
