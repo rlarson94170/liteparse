@@ -91,6 +91,8 @@ class LiteParse:
         num_workers: Optional[int] = None,
         image_mode: Optional[str] = None,
         extract_links: Optional[bool] = None,
+        ocr_failure_fatal: Optional[bool] = None,
+        ocr_hedge_delays_ms: Optional[List[int]] = None,
     ):
         """
         Initialize LiteParse parser.
@@ -112,6 +114,17 @@ class LiteParse:
             num_workers: Number of concurrent OCR workers (default: CPU cores - 1)
             extract_links: Render hyperlink annotations as ``[text](url)`` in
                 markdown output (default: True). Set False for plain anchor text.
+            ocr_failure_fatal: Whether a systemic OCR failure (every OCR task
+                failed and at least one was a text-sparse page) aborts the whole
+                parse (default: True). Set False to keep already-recovered native
+                text and return partial results instead of raising — for callers
+                that prefer a degraded document over a hard failure.
+            ocr_hedge_delays_ms: Request-hedging schedule for HTTP OCR, in
+                milliseconds. Empty or single-element means no hedging (one
+                request per attempt — the default). With multiple delays (e.g.
+                ``[0, 5000, 10000]``) each attempt fires a duplicate request at
+                every delay and takes the first to succeed, cancelling the rest
+                — trades extra OCR-server load for lower tail latency.
         """
         kwargs = {}
         if ocr_enabled is not None:
@@ -144,6 +157,10 @@ class LiteParse:
             kwargs["image_mode"] = image_mode
         if extract_links is not None:
             kwargs["extract_links"] = extract_links
+        if ocr_failure_fatal is not None:
+            kwargs["ocr_failure_fatal"] = ocr_failure_fatal
+        if ocr_hedge_delays_ms is not None:
+            kwargs["ocr_hedge_delays_ms"] = ocr_hedge_delays_ms
 
         self._native = _NativeLiteParse(**kwargs)
 

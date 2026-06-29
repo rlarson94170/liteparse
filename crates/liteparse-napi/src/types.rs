@@ -47,6 +47,14 @@ pub struct JsLiteParseConfig {
     /// Render hyperlink annotations as `[text](url)` in markdown output
     /// (default true). Set false for plain anchor text.
     pub extract_links: Option<bool>,
+    /// Whether a systemic OCR failure aborts the whole parse (default true).
+    /// Set false to keep already-recovered native text and return partial
+    /// results when OCR is unavailable, instead of rejecting.
+    pub ocr_failure_fatal: Option<bool>,
+    /// OCR request-hedging schedule (ms). Empty/unset = no hedging. Multiple
+    /// delays (e.g. `[0, 5000, 10000]`) fire duplicate requests per attempt and
+    /// take the first success — lower tail latency at the cost of extra load.
+    pub ocr_hedge_delays_ms: Option<Vec<u32>>,
 }
 
 impl JsLiteParseConfig {
@@ -105,6 +113,12 @@ impl JsLiteParseConfig {
         if let Some(v) = self.extract_links {
             cfg.extract_links = v;
         }
+        if let Some(v) = self.ocr_failure_fatal {
+            cfg.ocr_failure_fatal = v;
+        }
+        if let Some(v) = self.ocr_hedge_delays_ms {
+            cfg.ocr_hedge_delays_ms = v.into_iter().map(u64::from).collect();
+        }
         cfg
     }
 
@@ -137,6 +151,13 @@ impl JsLiteParseConfig {
                 ImageMode::Embed => "embed".to_string(),
             }),
             extract_links: Some(cfg.extract_links),
+            ocr_failure_fatal: Some(cfg.ocr_failure_fatal),
+            ocr_hedge_delays_ms: Some(
+                cfg.ocr_hedge_delays_ms
+                    .iter()
+                    .map(|&v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .collect(),
+            ),
         }
     }
 }

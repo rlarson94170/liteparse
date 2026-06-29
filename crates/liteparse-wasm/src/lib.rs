@@ -49,6 +49,8 @@ struct JsLiteParseConfig {
     output_format: Option<String>,
     image_mode: Option<String>,
     extract_links: Option<bool>,
+    ocr_failure_fatal: Option<bool>,
+    ocr_hedge_delays_ms: Option<Vec<u64>>,
     preserve_very_small_text: Option<bool>,
     password: Option<String>,
     quiet: Option<bool>,
@@ -104,6 +106,12 @@ impl JsLiteParseConfig {
         if let Some(v) = self.extract_links {
             cfg.extract_links = v;
         }
+        if let Some(v) = self.ocr_failure_fatal {
+            cfg.ocr_failure_fatal = v;
+        }
+        if let Some(v) = self.ocr_hedge_delays_ms {
+            cfg.ocr_hedge_delays_ms = v;
+        }
         if let Some(v) = self.preserve_very_small_text {
             cfg.preserve_very_small_text = v;
         }
@@ -142,6 +150,8 @@ impl JsLiteParseConfig {
                 ImageMode::Embed => "embed".into(),
             }),
             extract_links: Some(cfg.extract_links),
+            ocr_failure_fatal: Some(cfg.ocr_failure_fatal),
+            ocr_hedge_delays_ms: Some(cfg.ocr_hedge_delays_ms.clone()),
             preserve_very_small_text: Some(cfg.preserve_very_small_text),
             password: cfg.password.clone(),
             quiet: Some(cfg.quiet),

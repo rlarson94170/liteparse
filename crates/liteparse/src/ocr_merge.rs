@@ -282,6 +282,7 @@ pub(crate) async fn ocr_and_merge_rendered(
     ocr_engine: Arc<dyn OcrEngine>,
     ocr_language: &str,
     num_workers: usize,
+    ocr_failure_fatal: bool,
 ) -> Result<(), LiteParseError> {
     // Phase 1: spawn one async task per page. A semaphore limits how many run
     // `recognize` concurrently to `num_workers`.
@@ -493,10 +494,19 @@ pub(crate) async fn ocr_and_merge_rendered(
     // native-text document.
     if total_tasks > 0 && failed_tasks == total_tasks && failed_sparse_text_page {
         let detail = first_error.unwrap_or_else(|| "unknown error".to_string());
-        return Err(LiteParseError::Ocr(format!(
-            "OCR failed for all {} page(s): {}",
+        if ocr_failure_fatal {
+            return Err(LiteParseError::Ocr(format!(
+                "OCR failed for all {} page(s): {}",
+                total_tasks, detail
+            )));
+        }
+        // Non-fatal mode: the caller prefers partial results over a hard abort,
+        // so keep whatever native text was extracted and continue. Surface the
+        // root cause as a warning so a broken OCR setup is still visible.
+        eprintln!(
+            "[ocr] OCR failed for all {} page(s): {} — continuing with partial (native-text) results (ocr_failure_fatal=false)",
             total_tasks, detail
-        )));
+        );
     }
 
     // Surface a concise summary for partial failures without flooding stderr.
@@ -976,7 +986,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2, true).await;
 
         let err = result.expect_err("expected systemic OCR failure to be surfaced");
         let msg = err.to_string();
@@ -997,7 +1008,8 @@ mod tests {
         let mut pages = vec![make_blank_page(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, Vec::new(), 72.0, engine, "eng", 2).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, Vec::new(), 72.0, engine, "eng", 2, true).await;
 
         assert!(result.is_ok(), "empty OCR set should succeed: {result:?}");
     }
@@ -1011,7 +1023,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2, true).await;
 
         assert!(
             result.is_ok(),
@@ -1031,7 +1044,8 @@ mod tests {
         let rendered = vec![make_rendered(0), make_rendered(1)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2, true).await;
 
         let err = result.expect_err("a text-starved page losing all OCR must surface an error");
         assert!(
@@ -1049,12 +1063,34 @@ mod tests {
         let rendered = vec![make_rendered(0)];
         let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
 
-        let result = ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2).await;
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2, true).await;
 
         let err = result.expect_err("low-coverage text page losing OCR must surface an error");
         assert!(
             err.to_string().contains("OCR failed for all 1 page(s)"),
             "unexpected error message: {err}"
         );
+    }
+
+    // With `ocr_failure_fatal = false`, a systemic OCR failure that would
+    // normally abort (every task failed, a sparse-text page among them) must
+    // instead return Ok and preserve whatever native text was extracted, so a
+    // caller with its own fallback gets partial results rather than nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_non_fatal_systemic_failure_returns_partial() {
+        let mut pages = vec![make_native_text_page(1), make_blank_page(2)];
+        let rendered = vec![make_rendered(0), make_rendered(1)];
+        let engine: Arc<dyn OcrEngine> = Arc::new(FailingEngine);
+
+        let result =
+            ocr_and_merge_rendered(&mut pages, rendered, 72.0, engine, "eng", 2, false).await;
+
+        assert!(
+            result.is_ok(),
+            "non-fatal mode must not abort on systemic OCR failure: {result:?}"
+        );
+        // The native-text page keeps its text; the blank page simply has no OCR.
+        assert_eq!(pages[0].text_items.len(), 1);
     }
 }

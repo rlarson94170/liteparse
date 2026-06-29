@@ -38,6 +38,21 @@ pub struct LiteParseConfig {
     /// markdown output. Default on. Disable for benchmark parity with
     /// plain-text ground truth (the GT corpora never use link syntax).
     pub extract_links: bool,
+    /// Whether a systemic OCR failure (every OCR task failed *and* at least one
+    /// was a text-sparse page whose primary text source was OCR) aborts the
+    /// whole parse. Default `true`: surface the root cause instead of silently
+    /// emitting blank pages. Set `false` to keep already-recovered native text
+    /// and return partial results when OCR is unavailable — useful for callers
+    /// that prefer a degraded document over a hard failure (e.g. when the host
+    /// has its own OCR fallback or treats OCR as best-effort enrichment).
+    pub ocr_failure_fatal: bool,
+    /// OCR request-hedging schedule (milliseconds) for the HTTP OCR engine.
+    /// Empty (default) = no hedging. With multiple delays (e.g.
+    /// `[0, 5000, 10000, 15000, 20000]`), each OCR attempt fires a duplicate
+    /// request at every delay and takes the first to succeed — trading extra
+    /// OCR-server load for lower tail latency on a slow/stuck pod. No effect on
+    /// the Tesseract engine.
+    pub ocr_hedge_delays_ms: Vec<u64>,
 }
 
 /// Image handling for the markdown emitter.
@@ -86,6 +101,8 @@ impl Default for LiteParseConfig {
             num_workers: default_num_workers(),
             image_mode: ImageMode::Placeholder,
             extract_links: true,
+            ocr_failure_fatal: true,
+            ocr_hedge_delays_ms: Vec::new(),
         }
     }
 }

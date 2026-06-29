@@ -37,6 +37,20 @@ export interface LiteParseConfig {
   password?: string;
   quiet: boolean;
   numWorkers: number;
+  /**
+   * Whether a systemic OCR failure (every OCR task failed and at least one was
+   * a text-sparse page) aborts the whole parse (default: true). Set false to
+   * keep already-recovered native text and return partial results instead of
+   * rejecting — for callers that prefer a degraded document over a hard failure.
+   */
+  ocrFailureFatal: boolean;
+  /**
+   * OCR request-hedging schedule (ms). Empty (default) = no hedging. Multiple
+   * delays (e.g. `[0, 5000, 10000, 15000, 20000]`) fire duplicate requests per
+   * OCR attempt and take the first success — lower tail latency on a slow/stuck
+   * OCR pod, at the cost of extra OCR-server load. HTTP OCR engine only.
+   */
+  ocrHedgeDelaysMs: number[];
 }
 
 export interface TextItem {
@@ -183,6 +197,8 @@ export class LiteParse {
       password: userConfig.password,
       quiet: userConfig.quiet,
       numWorkers: userConfig.numWorkers,
+      ocrFailureFatal: userConfig.ocrFailureFatal,
+      ocrHedgeDelaysMs: userConfig.ocrHedgeDelaysMs,
     };
 
     this._native = new native.LiteParse(nativeConfig);
@@ -205,6 +221,8 @@ export class LiteParse {
       password: resolved.password ?? undefined,
       quiet: resolved.quiet ?? false,
       numWorkers: resolved.numWorkers ?? 1,
+      ocrFailureFatal: resolved.ocrFailureFatal ?? true,
+      ocrHedgeDelaysMs: resolved.ocrHedgeDelaysMs ?? [],
     };
   }
 

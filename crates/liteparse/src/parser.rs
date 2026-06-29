@@ -247,10 +247,18 @@ impl LiteParse {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(ref url) = self.config.ocr_server_url {
-                        std::sync::Arc::new(HttpOcrEngine::with_headers(
-                            url.clone(),
-                            self.config.ocr_server_headers.clone(),
-                        ))
+                        std::sync::Arc::new(
+                            HttpOcrEngine::with_headers(
+                                url.clone(),
+                                self.config.ocr_server_headers.clone(),
+                            )
+                            .with_retry(
+                                crate::ocr::http_simple::OcrRetryConfig {
+                                    hedge_delays_ms: self.config.ocr_hedge_delays_ms.clone(),
+                                    ..Default::default()
+                                },
+                            ),
+                        )
                     } else {
                         #[cfg(feature = "tesseract")]
                         {
@@ -329,6 +337,7 @@ impl LiteParse {
                 engine,
                 &self.config.ocr_language,
                 self.config.num_workers,
+                self.config.ocr_failure_fatal,
             )
             .await?;
         }

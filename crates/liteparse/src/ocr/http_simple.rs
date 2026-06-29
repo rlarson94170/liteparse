@@ -103,6 +103,137 @@ pub struct HttpOcrEngine {
     server_url: String,
     /// Extra headers (name, value) sent with every request, e.g. auth tokens.
     headers: Vec<(String, String)>,
+    /// Retry/backoff policy. Defaults to worker-parity semantics.
+    retry: OcrRetryConfig,
+}
+
+/// Retry/backoff policy for OCR HTTP requests. The defaults mirror the
+/// LlamaParse worker's OCR retry semantics (`ocrRetryPolicy.ts`: up to 10
+/// attempts, 1s base backoff doubling to a 10s cap, plus jitter, with a fast
+/// path for dropped connections) so that liteparse-driven OCR is as resilient
+/// to a down / rate-limited `/ocr` endpoint as the legacy worker path was.
+/// Without this, a transient outage or a 429 burst exhausts the old 3-attempt /
+/// sub-second-backoff budget and the page's OCR is lost.
+#[derive(Debug, Clone)]
+pub struct OcrRetryConfig {
+    /// Total attempts (1 initial + retries) before giving up on a request.
+    pub max_attempts: u32,
+    /// Backoff before the first retry; doubles each subsequent retry.
+    pub base_backoff_ms: u64,
+    /// Upper bound the doubling backoff is clamped to.
+    pub max_backoff_ms: u64,
+    /// Maximum random jitter added to each backoff, to de-correlate the
+    /// concurrent per-page retries (avoids a thundering herd when the server
+    /// recovers and every parked page retries at the same instant).
+    pub jitter_ms: u64,
+    /// Short fixed backoff for a mid-stream connection drop ("socket hang up"),
+    /// which is usually a single dropped keepalive rather than overload —
+    /// matches the worker's fast-retry special case.
+    pub fast_retry_ms: u64,
+    /// Per-request timeout.
+    pub request_timeout_ms: u64,
+    /// Request-hedging schedule, in milliseconds. Empty or single-element =
+    /// no hedging (one request per attempt — the default). With multiple
+    /// delays (e.g. `[0, 5000, 10000]`), each attempt fires a *duplicate*
+    /// request at every delay and takes the first to succeed, cancelling the
+    /// rest — a tail-latency trick (mirrors the worker's `OCR_HEDGE_DELAYS_MS`)
+    /// that trades extra OCR-server load for lower p99 latency when a request
+    /// lands on a slow/stuck pod. Opt-in: callers enable it via config.
+    pub hedge_delays_ms: Vec<u64>,
+}
+
+impl Default for OcrRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            base_backoff_ms: 1000,
+            max_backoff_ms: 10_000,
+            jitter_ms: 500,
+            fast_retry_ms: 500,
+            request_timeout_ms: 60_000,
+            hedge_delays_ms: Vec::new(),
+        }
+    }
+}
+
+/// Pseudo-random jitter in `0..=max` milliseconds. Derived from the wall-clock
+/// nanosecond fraction rather than a `rand` dependency; concurrent tasks sample
+/// at slightly different instants, which is enough to spread out retries.
+fn jitter_ms(max: u64) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % (max + 1))
+        .unwrap_or(0)
+}
+
+/// True for a mid-stream connection drop (peer reset / "socket hang up" /
+/// broken pipe). Walks the error source chain because reqwest wraps the
+/// underlying hyper/io cause. These get the short `fast_retry_ms` backoff.
+fn is_connection_drop(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        let msg = e.to_string().to_ascii_lowercase();
+        if msg.contains("connection reset")
+            || msg.contains("hang up")
+            || msg.contains("broken pipe")
+            || msg.contains("connection closed")
+            || msg.contains("incompletemessage")
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Send a single OCR request and return the raw response body. Encodes the
+/// multipart form fresh each call (a `Form` is consumed by `send`).
+async fn send_one(
+    client: &Client,
+    url: &str,
+    headers: &[(String, String)],
+    png_bytes: &[u8],
+    language: &str,
+    timeout_ms: u64,
+) -> Result<String, reqwest::Error> {
+    let form = Form::new()
+        .part(
+            "file",
+            Part::bytes(png_bytes.to_vec())
+                .file_name("image.png")
+                .mime_str("image/png")?,
+        )
+        .text("language", language.to_string());
+    let mut request = client
+        .post(url)
+        .multipart(form)
+        .timeout(Duration::from_millis(timeout_ms));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    match request.send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => resp.text().await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a failed request is worth retrying. Transient transport problems
+/// (connection refused/reset, timeouts) and overload/5xx status codes are
+/// retryable; a 4xx like 400/401/404 is a deterministic caller/config error
+/// that a retry would only repeat.
+fn is_retryable(err: &reqwest::Error) -> bool {
+    if err.is_timeout() || err.is_connect() {
+        return true;
+    }
+    if let Some(status) = err.status() {
+        return matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504);
+    }
+    // No status and not a clean connect/timeout classification (e.g. a body
+    // read that died mid-stream): treat as transient and retry.
+    err.is_body() || err.is_request()
 }
 
 impl HttpOcrEngine {
@@ -115,7 +246,87 @@ impl HttpOcrEngine {
             name: "http-ocr".to_string(),
             server_url,
             headers,
+            retry: OcrRetryConfig::default(),
         }
+    }
+
+    /// Override the retry/backoff policy (production uses the worker-parity
+    /// `Default`; tests inject a fast, low-attempt policy).
+    pub fn with_retry(mut self, retry: OcrRetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Send one OCR request, or — when `hedge_delays_ms` has more than one
+    /// entry — a hedged group: fire a duplicate request at each delay and
+    /// return the first success, aborting the slower in-flight duplicates.
+    /// Falls back to a plain single request (the common case) when hedging is
+    /// not configured.
+    async fn send_hedged(
+        &self,
+        client: &Client,
+        png_bytes: &[u8],
+        language: &str,
+    ) -> Result<String, reqwest::Error> {
+        let delays = &self.retry.hedge_delays_ms;
+        let timeout_ms = self.retry.request_timeout_ms;
+
+        // Single-request fast path: no hedging, or a single (possibly delayed)
+        // request. Borrows directly — no task spawn / cloning.
+        if delays.len() <= 1 {
+            if let Some(&d) = delays.first().filter(|&&d| d > 0) {
+                tokio::time::sleep(Duration::from_millis(d)).await;
+            }
+            return send_one(
+                client,
+                &self.server_url,
+                &self.headers,
+                png_bytes,
+                language,
+                timeout_ms,
+            )
+            .await;
+        }
+
+        // Hedged path: spawn one task per delay (spawned tasks need owned data,
+        // so clone the cheap bits and the PNG per hedge — the duplicate upload
+        // is the cost hedging deliberately pays). The first Ok wins and the
+        // remaining tasks are aborted (which cancels their in-flight requests);
+        // if all fail, surface the last error so the retry loop can back off.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(delays.len());
+        let mut handles = Vec::with_capacity(delays.len());
+        for &delay in delays {
+            let tx = tx.clone();
+            let client = client.clone();
+            let url = self.server_url.clone();
+            let headers = self.headers.clone();
+            let png = png_bytes.to_vec();
+            let lang = language.to_string();
+            handles.push(tokio::spawn(async move {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                let res = send_one(&client, &url, &headers, &png, &lang, timeout_ms).await;
+                let _ = tx.send(res).await;
+            }));
+        }
+        drop(tx);
+
+        let mut last_err: Option<reqwest::Error> = None;
+        while let Some(res) = rx.recv().await {
+            match res {
+                Ok(body) => {
+                    for h in &handles {
+                        h.abort();
+                    }
+                    return Ok(body);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // The channel only closes after every hedge task has sent its result,
+        // so at least one error is present when we reach here.
+        Err(last_err.expect("hedge group always yields at least one result"))
     }
 }
 
@@ -146,22 +357,48 @@ impl OcrEngine for HttpOcrEngine {
             img.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)?;
 
             let client = Client::new();
-            let form = Form::new()
-                .part(
-                    "file",
-                    Part::bytes(png_bytes)
-                        .file_name("image.png")
-                        .mime_str("image/png")?,
-                )
-                .text("language", options.language.clone());
-            let mut request = client
-                .post(&self.server_url)
-                .multipart(form)
-                .timeout(Duration::from_millis(60000));
-            for (name, value) in &self.headers {
-                request = request.header(name.as_str(), value.as_str());
-            }
-            let raw = request.send().await?.error_for_status()?.text().await?;
+
+            // Retry loop: each attempt sends one OCR request (or a hedged group
+            // of duplicates when configured) and backs off exponentially on
+            // transient failures. The PNG bytes above are encoded once and
+            // cloned per request.
+            let max_attempts = self.retry.max_attempts.max(1);
+            let mut attempt: u32 = 0;
+            let raw = loop {
+                attempt += 1;
+                match self
+                    .send_hedged(&client, &png_bytes, &options.language)
+                    .await
+                {
+                    Ok(body) => break body,
+                    Err(e) => {
+                        if attempt >= max_attempts || !is_retryable(&e) {
+                            return Err(e.into());
+                        }
+                        // A dropped connection ("socket hang up") gets a short
+                        // fixed backoff; everything else gets exponential
+                        // backoff clamped to the cap. Jitter spreads concurrent
+                        // page retries so they don't all hit a recovering
+                        // server at once.
+                        let base = if is_connection_drop(&e) {
+                            self.retry.fast_retry_ms
+                        } else {
+                            (self
+                                .retry
+                                .base_backoff_ms
+                                .saturating_mul(2u64.saturating_pow(attempt - 1)))
+                            .min(self.retry.max_backoff_ms)
+                        };
+                        let delay = base + jitter_ms(self.retry.jitter_ms);
+                        if std::env::var("LITEPARSE_DEBUG_OCR").is_ok() {
+                            eprintln!(
+                                "[ocr-http] attempt {attempt}/{max_attempts} failed ({e}); retrying in {delay}ms"
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+            };
             // Parse from the buffered body (rather than `.json()`) so a
             // malformed/unexpected response can surface a snippet of what the
             // server actually returned.
@@ -238,7 +475,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_recognize_network_error() {
-        let e = HttpOcrEngine::new("http://127.0.0.1:1/ocr".into());
+        // Single attempt so the connection-refused failure surfaces fast
+        // instead of grinding through the default multi-attempt backoff.
+        let e = HttpOcrEngine::new("http://127.0.0.1:1/ocr".into()).with_retry(OcrRetryConfig {
+            max_attempts: 1,
+            ..Default::default()
+        });
+        let opts = OcrOptions {
+            language: "eng".into(),
+            dpi: 150.0,
+        };
+        let r = e.recognize(&[0u8; 4], 1, 1, &opts).await;
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_default_retry_matches_worker_parity() {
+        let c = OcrRetryConfig::default();
+        assert_eq!(c.max_attempts, 10);
+        assert_eq!(c.base_backoff_ms, 1000);
+        assert_eq!(c.max_backoff_ms, 10_000);
+    }
+
+    #[test]
+    fn test_jitter_within_bounds() {
+        for _ in 0..1000 {
+            assert!(jitter_ms(500) <= 500);
+        }
+        assert_eq!(jitter_ms(0), 0);
+    }
+
+    #[test]
+    fn test_default_has_no_hedging() {
+        assert!(OcrRetryConfig::default().hedge_delays_ms.is_empty());
+    }
+
+    // Exercises the hedged spawn/mpsc path: two duplicate requests against a
+    // dead endpoint must both fail and the call returns Err (rather than
+    // hanging or panicking). Single attempt + zero backoff keeps it fast.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_hedged_all_fail_returns_error() {
+        let e = HttpOcrEngine::new("http://127.0.0.1:1/ocr".into()).with_retry(OcrRetryConfig {
+            max_attempts: 1,
+            hedge_delays_ms: vec![0, 10],
+            ..Default::default()
+        });
         let opts = OcrOptions {
             language: "eng".into(),
             dpi: 150.0,

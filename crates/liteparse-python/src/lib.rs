@@ -403,6 +403,8 @@ impl LiteParse {
         num_workers = None,
         image_mode = None,
         extract_links = None,
+        ocr_failure_fatal = None,
+        ocr_hedge_delays_ms = None,
     ))]
     fn new(
         ocr_language: Option<String>,
@@ -420,6 +422,8 @@ impl LiteParse {
         num_workers: Option<usize>,
         image_mode: Option<String>,
         extract_links: Option<bool>,
+        ocr_failure_fatal: Option<bool>,
+        ocr_hedge_delays_ms: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let mut cfg = LiteParseConfig::default();
         if let Some(v) = ocr_language {
@@ -474,6 +478,12 @@ impl LiteParse {
         }
         if let Some(v) = extract_links {
             cfg.extract_links = v;
+        }
+        if let Some(v) = ocr_failure_fatal {
+            cfg.ocr_failure_fatal = v;
+        }
+        if let Some(v) = ocr_hedge_delays_ms {
+            cfg.ocr_hedge_delays_ms = v;
         }
 
         let inner = liteparse::parser::LiteParse::new(cfg.clone());

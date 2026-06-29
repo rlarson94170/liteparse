@@ -35,6 +35,8 @@ export interface LiteParseNativeConfig {
   password?: string;
   quiet?: boolean;
   numWorkers?: number;
+  ocrFailureFatal?: boolean;
+  ocrHedgeDelaysMs?: number[];
 }
 
 export interface NativeTextItem {
