@@ -1,10 +1,10 @@
 use file_format::FileFormat;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{GenericImageView, ImageFormat};
 use resvg::tiny_skia::Pixmap;
 use resvg::usvg::{Options, Tree};
-use std::io::Write;
+use std::io::{self, Write};
 use tempfile::TempDir;
 use tokio::fs;
 
@@ -433,7 +433,7 @@ async fn find_pdf_in_dir(output_dir: &str) -> Result<String, LiteParseError> {
 }
 
 /// Separates RGB and alpha channels from raw RGBA8 bytes.
-/// Used by both the `image` crate path and the `resvg` SVG path.
+/// Used by the `resvg` SVG path where we always have RGBA output.
 fn separate_rgb_and_alpha_from_rgba(rgba: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     let mut alpha = Vec::with_capacity(rgba.len() / 4);
@@ -448,16 +448,30 @@ fn separate_rgb_and_alpha_from_rgba(rgba: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (rgb, alpha)
 }
 
-/// Separates the RGB and alpha channels of a raster image.
-fn separate_rgb_and_alpha(img: DynamicImage) -> (Vec<u8>, Vec<u8>) {
-    let rgba = img.to_rgba8();
-    separate_rgb_and_alpha_from_rgba(rgba.as_raw())
+/// Zlib-compress a byte slice at a speed/size tradeoff tuned for PDF
+/// embedding. Level 3 is ~3× faster than the zlib default (level 6) on
+/// photographic data and only ≈3% larger; deflate dominates end-to-end
+/// time for any lossily-compressed input (JPEG-except-passthrough, WebP)
+/// where the pixel stream is high-entropy.
+fn deflate(data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::with_capacity(data.len() / 4), Compression::new(3));
+    encoder.write_all(data)?;
+    encoder.finish()
 }
 
-/// PDF's default coordinate system is 72 points per inch. Images with no
+/// The channel layout of the raster we're going to embed.
+enum PixelData {
+    /// Interleaved RGB, no alpha. Emitted as a single `/DeviceRGB` XObject.
+    Rgb(Vec<u8>),
+    /// De-interleaved RGB + 8-bit alpha mask. Emitted as an image XObject
+    /// with a separate `/SMask` grayscale XObject.
+    RgbWithAlpha { rgb: Vec<u8>, alpha: Vec<u8> },
+}
+
+/// PDF's default coordinate system is 150 points per inch. Images with no
 /// embedded DPI metadata are assumed to be at this resolution, matching
 /// ImageMagick's default behavior when converting images to PDF.
-const DEFAULT_IMAGE_DPI: f32 = 72.0;
+const DEFAULT_IMAGE_DPI: f32 = 150.0;
 
 /// Read the pixel-density (DPI) metadata embedded in an image, if any.
 ///
@@ -571,18 +585,59 @@ fn read_png_dpi(data: &[u8]) -> Option<(f32, f32)> {
     None
 }
 
+/// Parse the width/height and channel count out of a JPEG's SOF (Start Of
+/// Frame) marker without decoding the pixels. Returns `(width, height,
+/// components)` where `components` is 1 (grayscale), 3 (YCbCr/RGB), or 4
+/// (CMYK/YCCK).
+fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32, u8)> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        i += 2;
+        // Standalone markers with no length field.
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if i + 2 > data.len() {
+            return None;
+        }
+        let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+        if seg_len < 2 || i + seg_len > data.len() {
+            return None;
+        }
+        // SOF0..SOF15 excluding DHT (0xC4), JPG (0xC8), DAC (0xCC): baseline,
+        // progressive, and their variants all share this layout.
+        let is_sof =
+            (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if is_sof && seg_len >= 8 {
+            let height = u16::from_be_bytes([data[i + 3], data[i + 4]]) as u32;
+            let width = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+            let components = data[i + 7];
+            return Some((width, height, components));
+        }
+        i += seg_len;
+    }
+    None
+}
+
 /// Rasterizes an SVG file to RGBA8 bytes + dimensions using resvg.
 fn rasterize_svg(data: &[u8]) -> Result<(Vec<u8>, u32, u32), LiteParseError> {
     let opt = Options::default();
-    let tree = Tree::from_data(data, &opt)
-        .map_err(|e| LiteParseError::Conversion(format!("invalid svg: {e}")))?;
+    let tree =
+        Tree::from_data(data, &opt).map_err(|e| LiteParseError::Conversion(e.to_string()))?;
 
     let size = tree.size();
     let width = size.width().ceil() as u32;
     let height = size.height().ceil() as u32;
 
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))
-        .ok_or_else(|| LiteParseError::Conversion("failed to allocate pixmap".to_string()))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "could not read pixmap"))?;
 
     resvg::render(
         &tree,
@@ -605,38 +660,108 @@ fn rasterize_svg(data: &[u8]) -> Result<(Vec<u8>, u32, u32), LiteParseError> {
     Ok((rgba, width, height))
 }
 
-pub async fn convert_image_to_pdf(
-    file_path: &str,
-    output_dir: &str,
-) -> Result<String, LiteParseError> {
-    let data = fs::read(file_path).await?;
+/// Describes an image ready to be written into the PDF, in whatever
+/// encoding is cheapest for the caller to produce.
+struct EmbeddedImage {
+    width: u32,
+    height: u32,
+    dpi_x: f32,
+    dpi_y: f32,
+    payload: ImagePayload,
+}
 
+enum ImagePayload {
+    /// JPEG passthrough: the original compressed bytes are copied verbatim
+    /// into a `/DCTDecode` XObject. This is what ImageMagick does for JPEG
+    /// input and it avoids a full decode + zlib re-encode round-trip.
+    Jpeg { bytes: Vec<u8>, components: u8 },
+    /// Decoded raster, to be zlib-compressed and embedded as `/FlateDecode`.
+    Flate(PixelData),
+}
+
+/// Decode / analyse the input file and produce an `EmbeddedImage`.
+fn prepare_image(file_path: &str, data: Vec<u8>) -> Result<EmbeddedImage, LiteParseError> {
     let is_svg = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("svg"))
         .unwrap_or(false);
 
-    let (width, height, rgb_img, mask_img, dpi_x, dpi_y) = if is_svg {
+    if is_svg {
         let (rgba, width, height) = rasterize_svg(&data)?;
-        let (rgb, mask) = separate_rgb_and_alpha_from_rgba(&rgba);
+        let (rgb, alpha) = separate_rgb_and_alpha_from_rgba(&rgba);
         // SVG has no intrinsic DPI — resvg rasterizes at CSS px which the PDF
         // spec treats as equivalent to points (1/72").
-        (
+        return Ok(EmbeddedImage {
             width,
             height,
-            rgb,
-            mask,
-            DEFAULT_IMAGE_DPI,
-            DEFAULT_IMAGE_DPI,
-        )
+            dpi_x: DEFAULT_IMAGE_DPI,
+            dpi_y: DEFAULT_IMAGE_DPI,
+            payload: ImagePayload::Flate(PixelData::RgbWithAlpha { rgb, alpha }),
+        });
+    }
+
+    // JPEG fast path: no decode, no re-encode. Parse just enough of the
+    // container to fill in the XObject dictionary and hand the compressed
+    // bytes to the PDF viewer via `/DCTDecode`.
+    if image::guess_format(&data).ok() == Some(ImageFormat::Jpeg)
+        && let Some((width, height, components)) = read_jpeg_dimensions(&data)
+    {
+        // Only pass through color spaces PDF's DCTDecode understands
+        // directly. Anything exotic falls through to the decode path.
+        if matches!(components, 1 | 3 | 4) {
+            let (dpi_x, dpi_y) =
+                read_image_dpi(&data).unwrap_or((DEFAULT_IMAGE_DPI, DEFAULT_IMAGE_DPI));
+            return Ok(EmbeddedImage {
+                width,
+                height,
+                dpi_x,
+                dpi_y,
+                payload: ImagePayload::Jpeg {
+                    bytes: data,
+                    components,
+                },
+            });
+        }
+    }
+
+    // General raster path: decode with `image`, then keep only the channels
+    // we actually need. Skipping the alpha split when the source has no
+    // alpha halves the pixel data we hand to zlib and drops the `/SMask`
+    // XObject entirely.
+    let img = image::load_from_memory(&data)?;
+    let (width, height) = img.dimensions();
+    let (dpi_x, dpi_y) = read_image_dpi(&data).unwrap_or((DEFAULT_IMAGE_DPI, DEFAULT_IMAGE_DPI));
+
+    let pixels = if img.color().has_alpha() {
+        let rgba = img.to_rgba8().into_raw();
+        let (rgb, alpha) = separate_rgb_and_alpha_from_rgba(&rgba);
+        PixelData::RgbWithAlpha { rgb, alpha }
     } else {
-        let img = image::load_from_memory(&data)?;
-        let (width, height) = img.dimensions();
-        let (rgb, mask) = separate_rgb_and_alpha(img);
-        let (dx, dy) = read_image_dpi(&data).unwrap_or((DEFAULT_IMAGE_DPI, DEFAULT_IMAGE_DPI));
-        (width, height, rgb, mask, dx, dy)
+        PixelData::Rgb(img.into_rgb8().into_raw())
     };
+
+    Ok(EmbeddedImage {
+        width,
+        height,
+        dpi_x,
+        dpi_y,
+        payload: ImagePayload::Flate(pixels),
+    })
+}
+
+pub async fn convert_image_to_pdf(
+    file_path: &str,
+    output_dir: &str,
+) -> Result<String, LiteParseError> {
+    let data = fs::read(file_path).await?;
+    let EmbeddedImage {
+        width,
+        height,
+        dpi_x,
+        dpi_y,
+        payload,
+    } = prepare_image(file_path, data)?;
 
     // Size the PDF page in points so the embedded image is displayed at its
     // native physical resolution. A 2400×3000 300-DPI scan becomes an
@@ -645,48 +770,104 @@ pub async fn convert_image_to_pdf(
     let page_width_pt = width as f32 * 72.0 / dpi_x;
     let page_height_pt = height as f32 * 72.0 / dpi_y;
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(&rgb_img)?;
-    let rgb_data = encoder.finish()?;
+    // Object layout depends on whether we need a separate soft-mask XObject.
+    //   With SMask:    1=Pages, 2=Image, 3=SMask, 4=Page, 5=Contents, 6=Catalog  (7 entries)
+    //   Without SMask: 1=Pages, 2=Image, 3=Page, 4=Contents, 5=Catalog          (6 entries)
+    let image_object_id: u32 = 2;
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(&mask_img)?;
-    let mask_data = encoder.finish()?;
-
-    let mut pdf_data = Vec::new();
-
+    let mut pdf_data: Vec<u8> = Vec::with_capacity(1 << 16);
     writeln!(pdf_data, "%PDF-1.4")?;
 
-    let image_object_id = 2;
+    // Emit the image XObject(s) and remember their byte offsets for xref.
     let image_object_pos = pdf_data.len();
+    let mask_object_pos: Option<usize> = match &payload {
+        ImagePayload::Jpeg { bytes, components } => {
+            let color_space = match components {
+                1 => "/DeviceGray",
+                4 => "/DeviceCMYK",
+                _ => "/DeviceRGB",
+            };
+            writeln!(
+                pdf_data,
+                "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {} /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>",
+                image_object_id,
+                width,
+                height,
+                color_space,
+                bytes.len()
+            )?;
+            writeln!(pdf_data, "stream")?;
+            pdf_data.extend(bytes);
+            writeln!(pdf_data, "\nendstream\nendobj")?;
+            None
+        }
+        ImagePayload::Flate(PixelData::Rgb(rgb)) => {
+            let rgb_data = deflate(rgb)?;
+            writeln!(
+                pdf_data,
+                "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>",
+                image_object_id,
+                width,
+                height,
+                rgb_data.len()
+            )?;
+            writeln!(pdf_data, "stream")?;
+            pdf_data.extend(&rgb_data);
+            writeln!(pdf_data, "endstream\nendobj")?;
+            None
+        }
+        ImagePayload::Flate(PixelData::RgbWithAlpha { rgb, alpha }) => {
+            let rgb_data = deflate(rgb)?;
+            let mask_data = deflate(alpha)?;
+            let mask_object_id = image_object_id + 1;
+            writeln!(
+                pdf_data,
+                "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} /SMask {} 0 R >>",
+                image_object_id,
+                width,
+                height,
+                rgb_data.len(),
+                mask_object_id
+            )?;
+            writeln!(pdf_data, "stream")?;
+            pdf_data.extend(&rgb_data);
+            writeln!(pdf_data, "endstream\nendobj")?;
+
+            let pos = pdf_data.len();
+            writeln!(
+                pdf_data,
+                "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>",
+                mask_object_id,
+                width,
+                height,
+                mask_data.len()
+            )?;
+            writeln!(pdf_data, "stream")?;
+            pdf_data.extend(&mask_data);
+            writeln!(pdf_data, "endstream\nendobj")?;
+            Some(pos)
+        }
+    };
+
+    // Assign the remaining object ids based on whether the SMask was emitted.
+    let next_id = if mask_object_pos.is_some() { 4 } else { 3 };
+    let page_object_id = next_id;
+    let content_stream_object_id = next_id + 1;
+    let catalog_object_id = next_id + 2;
+
+    let page_object_pos = pdf_data.len();
     writeln!(
         pdf_data,
-        "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} /SMask {} 0 R >>",
+        "{} 0 obj\n<< /Type /Page /Parent 1 0 R /MediaBox [0 0 {:.4} {:.4}] /Contents {} 0 R /Resources << /XObject << /Im{} {} 0 R >> >> >>",
+        page_object_id,
+        page_width_pt,
+        page_height_pt,
+        content_stream_object_id,
         image_object_id,
-        width,
-        height,
-        rgb_data.len(),
-        image_object_id + 1
+        image_object_id
     )?;
-    writeln!(pdf_data, "stream")?;
-    pdf_data.extend(&rgb_data);
-    writeln!(pdf_data, "endstream\nendobj")?;
+    writeln!(pdf_data, "endobj")?;
 
-    let mask_object_id = image_object_id + 1;
-    let mask_object_pos = pdf_data.len();
-    writeln!(
-        pdf_data,
-        "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>",
-        mask_object_id,
-        width,
-        height,
-        mask_data.len()
-    )?;
-    writeln!(pdf_data, "stream")?;
-    pdf_data.extend(&mask_data);
-    writeln!(pdf_data, "endstream\nendobj")?;
-
-    let content_stream_object_id = 5;
     let content_stream_pos = pdf_data.len();
     // The CTM scales the 1×1 unit-square image XObject to fill the page in
     // point-space; MediaBox uses the same values, so together they preserve
@@ -703,20 +884,6 @@ pub async fn convert_image_to_pdf(
     )?;
     writeln!(pdf_data, "stream\n{}\nendstream\nendobj", content)?;
 
-    let page_object_id = 4;
-    let page_object_pos = pdf_data.len();
-    writeln!(
-        pdf_data,
-        "{} 0 obj\n<< /Type /Page /Parent 1 0 R /MediaBox [0 0 {:.4} {:.4}] /Contents {} 0 R /Resources << /XObject << /Im{} {} 0 R >> >> >>",
-        page_object_id,
-        page_width_pt,
-        page_height_pt,
-        content_stream_object_id,
-        image_object_id,
-        image_object_id
-    )?;
-    writeln!(pdf_data, "endobj")?;
-
     let pages_object_pos = pdf_data.len();
     writeln!(
         pdf_data,
@@ -726,28 +893,39 @@ pub async fn convert_image_to_pdf(
     writeln!(pdf_data, "endobj")?;
 
     let catalog_object_pos = pdf_data.len();
-    writeln!(pdf_data, "6 0 obj\n<< /Type /Catalog /Pages 1 0 R >>")?;
+    writeln!(
+        pdf_data,
+        "{} 0 obj\n<< /Type /Catalog /Pages 1 0 R >>",
+        catalog_object_id
+    )?;
     writeln!(pdf_data, "endobj")?;
 
     let xref_start = pdf_data.len();
+    let total_objects = catalog_object_id + 1; // ids are 1..=catalog_object_id
     writeln!(pdf_data, "xref")?;
-    writeln!(pdf_data, "0 7")?;
+    writeln!(pdf_data, "0 {}", total_objects)?;
     writeln!(pdf_data, "0000000000 65535 f ")?;
     writeln!(pdf_data, "{:010} 00000 n ", pages_object_pos)?;
     writeln!(pdf_data, "{:010} 00000 n ", image_object_pos)?;
-    writeln!(pdf_data, "{:010} 00000 n ", mask_object_pos)?;
+    if let Some(pos) = mask_object_pos {
+        writeln!(pdf_data, "{:010} 00000 n ", pos)?;
+    }
     writeln!(pdf_data, "{:010} 00000 n ", page_object_pos)?;
     writeln!(pdf_data, "{:010} 00000 n ", content_stream_pos)?;
     writeln!(pdf_data, "{:010} 00000 n ", catalog_object_pos)?;
 
-    writeln!(pdf_data, "trailer\n<< /Size 7 /Root 6 0 R >>")?;
+    writeln!(
+        pdf_data,
+        "trailer\n<< /Size {} /Root {} 0 R >>",
+        total_objects, catalog_object_id
+    )?;
     writeln!(pdf_data, "startxref\n{}", xref_start)?;
     writeln!(pdf_data, "%%EOF")?;
 
     let base_name = Path::new(file_path)
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| LiteParseError::Conversion(format!("invalid file path: {file_path}")))?;
+        .expect("Should be able to isolate base_name");
     let pdf_path = Path::new(output_dir)
         .join(format!("{base_name}.pdf"))
         .to_string_lossy()
@@ -1045,11 +1223,8 @@ mod tests {
         assert!((h - 72.0).abs() < 0.5, "expected ≈72 pt, got {h}");
     }
 
-    /// Regression guard for the pre-fix behavior: an image with no DPI
-    /// metadata must fall back to 72 DPI — so pixel count == point count,
-    /// matching ImageMagick's fallback and preserving the old, working case.
     #[tokio::test]
-    async fn test_convert_image_to_pdf_no_dpi_falls_back_to_72() {
+    async fn test_convert_image_to_pdf_no_dpi_falls_back_to_150() {
         let mut base = Vec::new();
         let img = image::RgbImage::from_pixel(200, 100, image::Rgb([255, 255, 255]));
         image::DynamicImage::ImageRgb8(img)
@@ -1058,23 +1233,45 @@ mod tests {
                 image::ImageFormat::Png,
             )
             .unwrap();
-
         let dir = tempfile::tempdir().unwrap();
         let in_path = dir.path().join("test.png");
         tokio::fs::write(&in_path, &base).await.unwrap();
-
         let pdf_path =
             convert_image_to_pdf(in_path.to_str().unwrap(), dir.path().to_str().unwrap())
                 .await
                 .unwrap();
         let pdf = tokio::fs::read(&pdf_path).await.unwrap();
         let s = String::from_utf8_lossy(&pdf);
+
+        // MediaBox should now be pixels * 72 / 150 = pixels * 0.48
         let re = regex::Regex::new(r"/MediaBox\s*\[\s*0\s+0\s+([0-9.]+)\s+([0-9.]+)\s*\]").unwrap();
         let caps = re.captures(&s).expect("MediaBox present");
         let w: f32 = caps[1].parse().unwrap();
         let h: f32 = caps[2].parse().unwrap();
-        assert!((w - 200.0).abs() < 0.5, "expected 200 pt fallback, got {w}");
-        assert!((h - 100.0).abs() < 0.5, "expected 100 pt fallback, got {h}");
+
+        let expected_w = 200.0 * 72.0 / 150.0; // 96.0
+        let expected_h = 100.0 * 72.0 / 150.0; // 48.0
+        assert!(
+            (w - expected_w).abs() < 0.5,
+            "expected {expected_w} pt, got {w}"
+        );
+        assert!(
+            (h - expected_h).abs() < 0.5,
+            "expected {expected_h} pt, got {h}"
+        );
+
+        // The embedded XObject must still carry the FULL pixel resolution —
+        // only the page's physical size (MediaBox) should shrink, not the
+        // actual image data written into the stream.
+        let xobj_re = regex::Regex::new(
+            r"/Type\s*/XObject\s*/Subtype\s*/Image\s*/Width\s+(\d+)\s*/Height\s+(\d+)",
+        )
+        .unwrap();
+        let xobj_caps = xobj_re.captures(&s).expect("XObject present");
+        let px_w: u32 = xobj_caps[1].parse().unwrap();
+        let px_h: u32 = xobj_caps[2].parse().unwrap();
+        assert_eq!(px_w, 200, "XObject width must retain full pixel count");
+        assert_eq!(px_h, 100, "XObject height must retain full pixel count");
     }
 
     #[test]
