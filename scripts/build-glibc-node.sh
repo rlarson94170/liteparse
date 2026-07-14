@@ -21,13 +21,30 @@ TARGET="${1:?usage: build-glibc-node.sh <rust-target>}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-# build-essential/cmake/pkg-config: toolchain to compile Tesseract + Leptonica.
+# build-essential/pkg-config: toolchain to compile Tesseract + Leptonica.
 # lib*-dev: image-format deps Leptonica links against (same set apt pulls in for
 # libleptonica-dev on the ubuntu runner today).
+# cmake is installed separately below — bullseye's apt cmake (3.18) is too old
+# for Leptonica 1.84.1's C17 requirement (needs CMake >=3.21).
 apt-get install -y --no-install-recommends \
-  build-essential cmake git curl pkg-config ca-certificates \
+  build-essential git curl pkg-config ca-certificates \
   libtesseract-dev libleptonica-dev \
   libpng-dev libjpeg-dev libtiff-dev zlib1g-dev
+
+# Install a modern CMake (>=3.21) from Kitware's official static binaries so the
+# tesseract-rs Leptonica build can enable the C17 dialect. bullseye's apt cmake
+# (3.18) fails with "does not know the compile flags to use to enable C17".
+CMAKE_VERSION=3.31.7
+case "$TARGET" in
+  x86_64-*)  CMAKE_ARCH=x86_64 ;;
+  aarch64-*) CMAKE_ARCH=aarch64 ;;
+  *) echo "unsupported target for cmake install: $TARGET" >&2; exit 1 ;;
+esac
+curl --proto "=https" --tlsv1.2 -sSfL \
+  "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz" \
+  | tar -xz -C /opt
+export PATH="/opt/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}/bin:$PATH"
+cmake --version
 
 # Pin the same toolchain the non-container matrix builds use (dtolnay@1.95.0).
 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
